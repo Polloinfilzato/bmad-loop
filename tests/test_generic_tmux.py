@@ -1479,6 +1479,353 @@ def test_wait_for_completion_skips_transcriptless_subagent_stop(tmp_path):
     assert result.session_id == "main-sess"  # the subagent's toolu_ id is never recorded
 
 
+def test_wait_for_completion_ignores_foreign_identified_lifecycle_events(tmp_path):
+    """A nested CLI inherits the relay environment and writes into the parent's
+    stream (#767). Its announced SessionStart marks its id foreign, so neither
+    its Stop nor its SessionEnd may re-point the identity or end the session:
+    only the parent's own Stop completes it."""
+    adapter, impl = make_dev_adapter(tmp_path)
+    (impl / "spec-3-1-foo.md").write_text(
+        "---\nstatus: done\n---\n\n## Auto Run Result\n\nStatus: done\n"
+    )
+    outer_id = "outer-session"
+    child_id = "nested-child"
+    adapter.watcher = _ScriptedWatcher(
+        [
+            _hook_event("SessionStart", session_id=outer_id, transcript_path="/outer.jsonl"),
+            _hook_event("SessionStart", session_id=child_id, transcript_path="/child.jsonl"),
+            _stop_event("3-1-dev-1", child_id, "/child.jsonl"),
+            _hook_event("SessionEnd", session_id=child_id, transcript_path="/child.jsonl"),
+            _stop_event("3-1-dev-1", outer_id, "/outer.jsonl"),
+        ]
+    )
+
+    result = adapter.wait_for_completion(_dev_handle(), _dev_spec(tmp_path))
+
+    assert result.status == "completed"
+    assert result.session_id == outer_id
+    assert result.transcript_path == "/outer.jsonl"
+    assert result.stop_seen is True
+    ignored = [
+        entry
+        for entry in _lifecycle_lines(adapter)
+        if entry["event"] == "foreign-hook-event-ignored"
+    ]
+    # one crumb per foreign id, on its first dropped event (the announcing start)
+    (crumb,) = ignored
+    assert crumb == {
+        "ts": crumb["ts"],
+        "event": "foreign-hook-event-ignored",
+        "hook_event": "SessionStart",
+        "foreign_session_id": child_id,
+        "dropped_so_far": 1,
+    }
+    assert "/child.jsonl" not in json.dumps(ignored)
+
+
+def test_wait_for_completion_accepts_identified_session_end_before_any_start(tmp_path):
+    """An identified SessionEnd that arrives before any SessionStart never
+    announced a foreign id, so it is the launched session's own exit — a CLI
+    that quit before its SessionStart hook fired (the #727 trust-dialog exit,
+    see test_no_work_session_end_after_nudge_echo). It must crash the session,
+    not be dropped (dropping it hung the loop forever: review blocker B2)."""
+    adapter, _ = make_dev_adapter(tmp_path)
+    adapter.watcher = _ScriptedWatcher(
+        [_hook_event("SessionEnd", session_id="outer-session", transcript_path="/outer.jsonl")]
+    )
+
+    result = adapter.wait_for_completion(_dev_handle(), _dev_spec(tmp_path))
+
+    assert result.status == "crashed"
+    assert result.session_id == "outer-session"
+    assert not any(
+        entry["event"] == "foreign-hook-event-ignored" for entry in _lifecycle_lines(adapter)
+    )
+
+
+def test_wait_for_completion_ignores_child_end_after_unidentified_session_start(tmp_path):
+    """An anonymous first SessionStart (a payload the relay could not read)
+    still uses up the launched session's slot, so a nested child's identified
+    start after it is foreign: the child's Stop and SessionEnd are dropped and
+    the parent's own identified Stop completes the session."""
+    adapter, impl = make_dev_adapter(tmp_path)
+    (impl / "spec-3-1-foo.md").write_text(
+        "---\nstatus: done\n---\n\n## Auto Run Result\n\nStatus: done\n"
+    )
+    outer_id = "outer-session"
+    child_id = "nested-child"
+    adapter.watcher = _ScriptedWatcher(
+        [
+            _hook_event("SessionStart", session_id=None),
+            _hook_event("SessionStart", session_id=child_id, transcript_path="/child.jsonl"),
+            _stop_event("3-1-dev-1", child_id, "/child.jsonl"),
+            _hook_event("SessionEnd", session_id=child_id, transcript_path="/child.jsonl"),
+            _stop_event("3-1-dev-1", outer_id, "/outer.jsonl"),
+        ]
+    )
+
+    result = adapter.wait_for_completion(_dev_handle(), _dev_spec(tmp_path))
+
+    assert result.status == "completed"
+    assert result.session_id == outer_id
+    assert result.transcript_path == "/outer.jsonl"
+    ignored = [
+        entry
+        for entry in _lifecycle_lines(adapter)
+        if entry["event"] == "foreign-hook-event-ignored"
+    ]
+    assert [(entry["hook_event"], entry["foreign_session_id"]) for entry in ignored] == [
+        ("SessionStart", child_id)
+    ]
+
+
+def test_wait_for_completion_foreign_start_never_repoints_transcript(tmp_path, monkeypatch):
+    """Review finding M2: a nested child's SessionStart as the LAST hook event,
+    then window death. The dropped start must not re-point the identity or the
+    transcript at the child's, so the crash is reported against the parent's
+    session and transcript (the ones the engine reads usage and evidence from).
+
+    Ablation: turn the non-admitted `continue` into crumb-and-fall-through and
+    this fails (the PR's own foreign-start test passed under that change)."""
+    monkeypatch.setattr(generic, "RESULT_GRACE_S", 0.0)
+    monkeypatch.setattr(generic, "RESULT_POLL_S", 0.0)
+    adapter, _ = make_dev_adapter(tmp_path)
+    adapter._window_alive = lambda handle: False  # dies after the child's start
+    adapter.watcher = _ScriptedWatcher(
+        [
+            _hook_event("SessionStart", session_id="sess-a", transcript_path="/a.jsonl"),
+            _hook_event("SessionStart", session_id="sess-b", transcript_path="/b.jsonl"),
+        ]
+    )
+
+    result = adapter.wait_for_completion(_dev_handle(), _dev_spec(tmp_path))
+
+    assert result.status == "crashed"
+    assert result.session_id == "sess-a"
+    assert result.transcript_path == "/a.jsonl"
+
+
+def test_wait_for_completion_crumbs_each_foreign_id_once(tmp_path):
+    """Two nested children, each with several dropped events: one
+    `foreign-hook-event-ignored` crumb per foreign id (on its announcing
+    start), each carrying the running drop count — not one crumb per event.
+
+    Ablation: crumb every dropped event and the single-crumb-per-id assertion
+    fails."""
+    adapter, impl = make_dev_adapter(tmp_path)
+    (impl / "spec-3-1-foo.md").write_text(
+        "---\nstatus: done\n---\n\n## Auto Run Result\n\nStatus: done\n"
+    )
+    adapter.watcher = _ScriptedWatcher(
+        [
+            _hook_event("SessionStart", session_id="parent", transcript_path="/p.jsonl"),
+            _hook_event("SessionStart", session_id="child-1", transcript_path="/c1.jsonl"),
+            _stop_event("3-1-dev-1", "child-1", "/c1.jsonl"),
+            _hook_event("SessionStart", session_id="child-2", transcript_path="/c2.jsonl"),
+            _stop_event("3-1-dev-1", "child-2", "/c2.jsonl"),
+            _stop_event("3-1-dev-1", "child-1", "/c1.jsonl"),
+            _hook_event("SessionEnd", session_id="child-2", transcript_path="/c2.jsonl"),
+            _stop_event("3-1-dev-1", "parent", "/p.jsonl"),
+        ]
+    )
+
+    result = adapter.wait_for_completion(_dev_handle(), _dev_spec(tmp_path))
+
+    assert result.status == "completed"
+    assert result.session_id == "parent"
+    ignored = [
+        (entry["foreign_session_id"], entry["hook_event"], entry["dropped_so_far"])
+        for entry in _lifecycle_lines(adapter)
+        if entry["event"] == "foreign-hook-event-ignored"
+    ]
+    assert ignored == [("child-1", "SessionStart", 1), ("child-2", "SessionStart", 3)]
+
+
+def test_foreign_hook_events_count_reaches_heartbeat_and_timeout_fired(tmp_path, monkeypatch):
+    """A session whose only hook events were a nested child's times out with
+    the drop count visible where an operator looks: heartbeat.json's
+    `foreign_hook_events` and the `timeout-fired` crumb (#767). A timeout
+    caused by dropped events is then diagnosable from the journal alone.
+
+    Ablation: drop the key from either payload and this fails."""
+    adapter, clock = _timeout_clock_adapter(tmp_path, monkeypatch)
+    adapter._stall_grace_s = 0.0
+    heartbeats: list[dict] = []
+    adapter._write_heartbeat = lambda task_id, payload: heartbeats.append(payload)
+
+    def advance(call_n):
+        # the third event's tick crosses a heartbeat interval; the idle tick
+        # after it crosses the deadline
+        if call_n == 3:
+            clock["mono"] += generic.HEARTBEAT_INTERVAL_S + 1.0
+        elif call_n > 3:
+            clock["mono"] += 1000.0
+
+    adapter.watcher = _ScriptedWatcher(
+        [
+            _hook_event("SessionStart", session_id="parent", transcript_path=None),
+            _hook_event("SessionStart", session_id="child", transcript_path=None),
+            _stop_event("3-1-dev-1", "child", None),
+        ],
+        on_call=advance,
+    )
+    result = adapter.wait_for_completion(_dev_handle(), _short_spec(tmp_path, timeout_s=100.0))
+
+    assert result.status == "timeout"
+    assert [hb["foreign_hook_events"] for hb in heartbeats] == [0, 2]
+    (fired,) = _lifecycle_events(adapter, "timeout-fired")
+    assert fired["foreign_hook_events"] == 2
+
+
+def test_wait_for_completion_accepts_rotated_session_id_stop(tmp_path):
+    """A session id can rotate without a new SessionStart (claude /clear or
+    compaction). The rotated id never announced itself, so its Stop is the
+    launched session's own turn-end and completes it (review finding M1: the
+    allow-list dropped it and the session stalled)."""
+    adapter, impl = make_dev_adapter(tmp_path)
+    (impl / "spec-3-1-foo.md").write_text(
+        "---\nstatus: done\n---\n\n## Auto Run Result\n\nStatus: done\n"
+    )
+    adapter.watcher = _ScriptedWatcher(
+        [
+            _hook_event("SessionStart", session_id="sess-a", transcript_path="/a.jsonl"),
+            _stop_event("3-1-dev-1", "sess-b", "/b.jsonl"),
+        ]
+    )
+
+    result = adapter.wait_for_completion(_dev_handle(), _dev_spec(tmp_path))
+
+    assert result.status == "completed"
+    assert result.session_id == "sess-b"
+    assert result.transcript_path == "/b.jsonl"
+    assert not any(
+        entry["event"] == "foreign-hook-event-ignored" for entry in _lifecycle_lines(adapter)
+    )
+
+
+def test_wait_for_completion_rebinds_on_clear_source_start(tmp_path):
+    """A /clear fires a fresh SessionStart with a new id and source "clear". That
+    is the launched session rotating its id, not a nested CLI, so attribution
+    rebinds to it: its Stop completes the session under the new id and nothing
+    is journaled as foreign (#767)."""
+    adapter, impl = make_dev_adapter(tmp_path)
+    (impl / "spec-3-1-foo.md").write_text(
+        "---\nstatus: done\n---\n\n## Auto Run Result\n\nStatus: done\n"
+    )
+    adapter.watcher = _ScriptedWatcher(
+        [
+            _hook_event("SessionStart", session_id="sess-a", transcript_path="/a.jsonl"),
+            _hook_event(
+                "SessionStart", session_id="sess-b", transcript_path="/b.jsonl", source="clear"
+            ),
+            _stop_event("3-1-dev-1", "sess-b", "/b.jsonl"),
+        ]
+    )
+
+    result = adapter.wait_for_completion(_dev_handle(), _dev_spec(tmp_path))
+
+    assert result.status == "completed"
+    assert result.session_id == "sess-b"
+    assert result.transcript_path == "/b.jsonl"
+    assert not any(
+        entry["event"] == "foreign-hook-event-ignored" for entry in _lifecycle_lines(adapter)
+    )
+
+
+def test_wait_for_completion_copilot_bound_subagent_stop_not_crumbed(tmp_path):
+    """Once Copilot's sessionStart binds the main id, a subagent's toolu_ Stop
+    still passes attribution (the toolu_ id never announced a start) and is
+    dropped by the subagent_stop_without_transcript filter instead — so it is
+    never journaled as a foreign session, and the main Stop completes."""
+    adapter, impl = make_dev_adapter(tmp_path, profile_name="copilot")
+
+    def flush_terminal_spec(call_n):
+        # the spec lands only after the (ignored) subagent Stop, as in
+        # test_wait_for_completion_skips_transcriptless_subagent_stop
+        if call_n == 3:
+            (impl / "spec-3-1-foo.md").write_text(
+                "---\nstatus: done\n---\n\n## Auto Run Result\n\nStatus: done\n"
+            )
+
+    adapter.watcher = _ScriptedWatcher(
+        [
+            _hook_event("SessionStart", session_id="main-sess", transcript_path=None),
+            _stop_event("3-1-dev-1", "toolu_bdrk_subagent", None),  # subagent: ignored
+            _stop_event("3-1-dev-1", "main-sess", "/run/events.jsonl"),  # main turn-end
+        ],
+        on_call=flush_terminal_spec,
+    )
+    result = adapter.wait_for_completion(_dev_handle(), _dev_spec(tmp_path))
+
+    assert result.status == "completed"
+    assert result.session_id == "main-sess"
+    assert result.transcript_path == "/run/events.jsonl"
+    assert not any(
+        entry["event"] == "foreign-hook-event-ignored" for entry in _lifecycle_lines(adapter)
+    )
+
+
+def test_wait_for_completion_keeps_identified_stop_for_stop_only_profile(tmp_path):
+    """A Stop-only profile (no SessionStart) never binds, so attribution admits
+    every event and its established identified-Stop completion stays intact."""
+    adapter, impl = make_dev_adapter(tmp_path, profile_name="antigravity")
+    (impl / "spec-3-1-foo.md").write_text(
+        "---\nstatus: done\n---\n\n## Auto Run Result\n\nStatus: done\n"
+    )
+    adapter.watcher = _ScriptedWatcher(
+        [_stop_event("3-1-dev-1", "stop-only-session", "/legacy.jsonl")]
+    )
+
+    result = adapter.wait_for_completion(_dev_handle(), _dev_spec(tmp_path))
+
+    assert result.status == "completed"
+    assert result.session_id == "stop-only-session"
+    assert result.transcript_path == "/legacy.jsonl"
+    assert _lifecycle_lines(adapter) == []
+
+
+def test_wait_for_completion_keeps_matching_parent_session_end_crash(tmp_path):
+    """The launched session's own SessionEnd (same id as its bound start) is
+    admitted and still crashes the session."""
+    adapter, _ = make_dev_adapter(tmp_path)
+    outer_id = "outer-session"
+    adapter.watcher = _ScriptedWatcher(
+        [
+            _hook_event("SessionStart", session_id=outer_id, transcript_path="/outer.jsonl"),
+            _hook_event("SessionEnd", session_id=outer_id, transcript_path="/outer.jsonl"),
+        ]
+    )
+
+    result = adapter.wait_for_completion(_dev_handle(), _dev_spec(tmp_path))
+
+    assert result.status == "crashed"
+    assert result.session_id == outer_id
+    assert result.transcript_path == "/outer.jsonl"
+    assert _lifecycle_lines(adapter) == []
+
+
+def test_wait_for_completion_preserves_no_id_hook_compatibility(tmp_path):
+    """Id-less events carry no attribution signal and are always admitted, so a
+    relay/CLI that sends no session id completes exactly as before."""
+    adapter, impl = make_dev_adapter(tmp_path)
+    (impl / "spec-3-1-foo.md").write_text(
+        "---\nstatus: done\n---\n\n## Auto Run Result\n\nStatus: done\n"
+    )
+    adapter.watcher = _ScriptedWatcher(
+        [
+            _hook_event("SessionStart", session_id=None, transcript_path="/legacy.jsonl"),
+            _stop_event("3-1-dev-1", None, "/legacy.jsonl"),
+        ]
+    )
+
+    result = adapter.wait_for_completion(_dev_handle(), _dev_spec(tmp_path))
+
+    assert result.status == "completed"
+    assert result.session_id is None
+    assert result.transcript_path == "/legacy.jsonl"
+    assert _lifecycle_lines(adapter) == []
+
+
 def test_wait_for_completion_transcriptless_stop_is_terminal_without_flag(tmp_path):
     """Gating: a profile without subagent_stop_without_transcript (claude) still
     treats every Stop as the main turn-end, so a result-less one stalls the dev
@@ -2383,6 +2730,7 @@ def test_heartbeat_written_and_throttled(tmp_path, monkeypatch):
         "stall_nudges_failed": 0,
         "probe_failures": 0,
         "usage_sample_failures": 0,
+        "foreign_hook_events": 0,  # no nested CLI's events were dropped (#767)
     }
     assert [w["remaining_s"] for w in writes] == [100.0, 59.0]  # tick 2 was throttled
     hb = json.loads((adapter.tasks_dir / "3-1-dev-1" / "heartbeat.json").read_text())
@@ -8723,15 +9071,24 @@ BYPASS_HEADING = "WARNING: Claude Code running in Bypass Permissions " + "mode"
 BYPASS_FOOTER = "Enter to confirm · Esc " + "to cancel"
 
 
-def _hook_event(kind, notification_type=None):
+def _hook_event(
+    kind,
+    notification_type=None,
+    *,
+    task_id="3-1-dev-1",
+    session_id="sess",
+    transcript_path=None,
+    source=None,
+):
     return HookEvent(
         ts=1,
         event=kind,
-        task_id="3-1-dev-1",
-        session_id="sess",
-        transcript_path=None,
+        task_id=task_id,
+        session_id=session_id,
+        transcript_path=transcript_path,
         path=Path("x"),
         notification_type=notification_type,
+        source=source,
     )
 
 

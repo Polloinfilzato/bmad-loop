@@ -20,7 +20,7 @@ from __future__ import annotations
 
 import json
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable
 
@@ -38,6 +38,11 @@ class HookEvent:
     # relay that predates the field, and for a non-string value. APPENDED with a
     # default so every positional construction stays valid.
     notification_type: str | None = None
+    # A SessionStart's `source` (#767) — claude/gemini's startup|resume|clear|
+    # compact, or another CLI's own value. None on every other event, on an older
+    # vendored relay that predates the field, and for a non-string value.
+    # APPENDED with a default, like notification_type above.
+    source: str | None = None
 
 
 def _event_dirs(events_dir: Path, legacy_dir: Path | None) -> list[Path]:
@@ -59,15 +64,21 @@ def _parse_event(entry: Path) -> HookEvent | None:
         return None
     if not isinstance(data, dict) or "event" not in data or "task_id" not in data:
         return None
+    session_id = data.get("session_id")
+    transcript_path = data.get("transcript_path")
     notification_type = data.get("notification_type")
+    source = data.get("source")
+    # Payload values are forwarded from the CLI unvalidated, so a non-string one
+    # reads as absent rather than reaching attribution's set arithmetic (#767).
     return HookEvent(
         ts=int(data.get("ts", 0)),
         event=str(data["event"]),
         task_id=str(data["task_id"]),
-        session_id=data.get("session_id"),
-        transcript_path=data.get("transcript_path"),
+        session_id=session_id if isinstance(session_id, str) else None,
+        transcript_path=transcript_path if isinstance(transcript_path, str) else None,
         path=entry,
         notification_type=notification_type if isinstance(notification_type, str) else None,
+        source=source if isinstance(source, str) else None,
     )
 
 
@@ -76,8 +87,107 @@ def is_session_event(event: HookEvent, task_id: str, since_ns: int = 0) -> bool:
     the session's own id, which folds in the attempt number and generation
     (``engine._session_task_id``), so another attempt's events never match;
     ``since_ns`` is that attempt's launch floor, which drops a stale event a
-    resumed run left under the same re-minted id (see ``SignalWatcher.wait_for``)."""
+    resumed run left under the same re-minted id (see ``SignalWatcher.wait_for``).
+
+    It is the first of two layers. The task id comes from the relay's inherited
+    environment, so a nested coding-CLI process started inside the session
+    stamps its own events with the same id; :class:`SessionAttribution` is the
+    second layer, deciding which CLI session inside the attempt's stream is the
+    launched one."""
     return event.task_id == task_id and (not since_ns or event.ts >= since_ns)
+
+
+# SessionStart sources that keep the launched session's identity across an id
+# change: claude/gemini rotate the session id on /clear and may on compaction.
+REBIND_SOURCES = frozenset({"clear", "compact"})
+
+
+@dataclass
+class SessionAttribution:
+    """Second layer after :func:`is_session_event`: which CLI session inside one
+    attempt's event stream is the launched one (#767).
+
+    A nested coding-CLI process started from inside the session inherits the
+    relay environment, so its SessionStart/Stop/SessionEnd land in the parent's
+    stream under the parent's task id. The rule is a deny-list: an id is foreign
+    only once it has announced its own SessionStart after the launched session's
+    first SessionStart. Every other event is admitted — id-less events, ids that
+    never announced a start (a rotated id, a Copilot ``toolu_`` subagent Stop),
+    and anything before the first start, including an identified SessionEnd from
+    a CLI that exited before its SessionStart fired (#727). Failing toward
+    acceptance keeps attribution a pure filter: it only ever drops a known
+    child's events and never adds a completion path.
+
+    The first SessionStart is the launched session's whether identified or not:
+    an anonymous start (a payload the relay could not read) still uses up the
+    parent's slot, so a child's identified start after it is foreign.
+
+    A later SessionStart with a new id whose ``source`` is in
+    :data:`REBIND_SOURCES` ("clear", "compact") is the launched session itself
+    rotating its id, so it rebinds rather than going foreign. Deliberately not
+    "resume" — a nested child launched with ``--resume`` must stay foreign, and a
+    bmad-loop resume is a new attempt with a fresh task id and so a fresh
+    attribution — and not "startup", which is exactly what a nested child sends.
+    An older vendored relay forwards no ``source``, so there a clear/compact start
+    with a new id reads as foreign and the session falls back to window death or
+    its timeout; ``bmad-loop init`` re-vendors the relay.
+
+    ``source`` alone is not trusted. An id already found foreign never rebinds
+    (a child compacting under its own id), and a "clear" start after a foreign
+    id's SessionEnd is that child clearing — claude ends the old session with a
+    SessionEnd before the clear start — so the new id is foreign too, unless the
+    bound session also ended since the last start (the two relays write
+    independently, so a child's end can land between the parent's end and its
+    clear start). A child that rotates its id without a preceding SessionEnd
+    still rebinds; only a relay-side lineage check could tell it apart.
+
+    Accepted limitation: a child SessionEnd whose child never announced a
+    SessionStart is indistinguishable from the parent's own and is admitted.
+    Nested CLIs announce their start, so this is documented, not defended."""
+
+    started: bool = False  # the launched session's first SessionStart was seen
+    bound_id: str | None = None  # its id (None when that start was anonymous)
+    foreign_ids: set[str] = field(default_factory=set)
+    # Which sessions ended since the last SessionStart: evidence for whose
+    # "clear" start comes next.
+    bound_ended: bool = False
+    foreign_ended: bool = False
+
+    def admit(self, event: HookEvent) -> bool:
+        """Whether ``event`` belongs to the launched session. Stateful: a
+        SessionStart can bind the session or mark its id foreign."""
+        sid = event.session_id
+        if event.event == "SessionStart":
+            bound_ended, foreign_ended = self.bound_ended, self.foreign_ended
+            self.bound_ended = self.foreign_ended = False
+            if not self.started:
+                self.started, self.bound_id = True, sid
+                return True
+            if not sid or sid == self.bound_id:
+                return True
+            if (
+                sid not in self.foreign_ids
+                and event.source in REBIND_SOURCES
+                and not (event.source == "clear" and foreign_ended and not bound_ended)
+            ):
+                self.bound_id = sid
+                return True
+            self.foreign_ids.add(sid)
+            return False
+        if event.event == "SessionEnd" and sid:
+            if sid == self.bound_id:
+                self.bound_ended = True
+            elif sid in self.foreign_ids:
+                self.foreign_ended = True
+        return not (sid and sid in self.foreign_ids)
+
+
+def attribute_events(events: list[HookEvent]) -> tuple[list[HookEvent], set[str]]:
+    """Replay :class:`SessionAttribution` over an oldest-first snapshot (e.g.
+    :func:`session_events`): the admitted events, and every id found foreign."""
+    attribution = SessionAttribution()
+    admitted = [event for event in events if attribution.admit(event)]
+    return admitted, attribution.foreign_ids
 
 
 def session_events(
