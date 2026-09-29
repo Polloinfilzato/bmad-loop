@@ -162,14 +162,6 @@ class CLIProfile:
     launch_args: tuple[str, ...] = ()
     bypass_args: tuple[str, ...] = ()
     model_flag: str = "--model"
-    # The CLI's launch flag for a caller-chosen session id (DW-505), e.g. claude's
-    # "--session-id". When set, the generic adapter mints a UUID4 per launch,
-    # appends `[session_id_flag, uuid]` to the launched argv and pins hook-event
-    # attribution to it (signals.SessionAttribution), so a nested child's
-    # SessionEnd is foreign even when the child never announced a SessionStart
-    # (DW-508). "" = off: attribution learns the id from the first SessionStart.
-    # An argv flag, so it is part of runsetup.config_digest's launch surface.
-    session_id_flag: str = ""
     env: dict[str, str] = field(default_factory=dict)
     usage_parser: str = "none"
     # seconds to keep polling the transcript for token usage after the session
@@ -251,6 +243,15 @@ class CLIProfile:
     # APPENDED with a default so every positional CLIProfile construction stays
     # valid.
     workspace_trust: WorkspaceTrustSpec | None = None
+    # The CLI's launch flag for a caller-chosen session id (DW-505), e.g. claude's
+    # "--session-id". When set, the generic adapter mints a UUID4 per launch,
+    # appends `[session_id_flag, uuid]` to the launched argv and pins hook-event
+    # attribution to it (signals.SessionAttribution), so a nested child's
+    # SessionEnd is foreign even when the child never announced a SessionStart
+    # (DW-508). "" = off: attribution learns the id from the first SessionStart.
+    # An argv flag, so it is part of runsetup.config_digest's launch surface.
+    # APPENDED after workspace_trust for the same positional-compatibility reason.
+    session_id_flag: str = ""
 
     @property
     def hookless(self) -> bool:

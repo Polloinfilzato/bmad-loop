@@ -1,3 +1,4 @@
+import dataclasses
 from importlib import resources
 from pathlib import Path
 
@@ -432,6 +433,22 @@ def test_only_claude_ships_a_session_id_flag():
     assert profiles["claude"].session_id_flag == "--session-id"
     others = {name: p.session_id_flag for name, p in profiles.items() if name != "claude"}
     assert others and all(flag == "" for flag in others.values()), others
+
+
+def test_cli_profile_fields_only_ever_append():
+    """An entry-point provider may construct `CLIProfile` positionally, so a new
+    field goes after every existing one; inserting `session_id_flag` after
+    `model_flag` would hand such a provider's `env` dict to it and reject the
+    provider's whole batch. This is the field order as released before DW-505."""
+    released = [
+        "name", "binary", "hooks", "adapter", "skill_tree", "prompt_template",
+        "launch_args", "bypass_args", "model_flag", "env", "usage_parser",
+        "usage_grace_s", "stop_without_result_nudges",
+        "subagent_stop_without_transcript", "first_run_note", "seed_files",
+        "env_fault_patterns", "parked_prompt_patterns", "packaged", "workspace_trust",
+    ]  # fmt: skip
+    names = [f.name for f in dataclasses.fields(CLIProfile)]
+    assert names[: len(released)] == released
 
 
 def test_session_id_flag_defaults_empty_and_parses(tmp_path):
