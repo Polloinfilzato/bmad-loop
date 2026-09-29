@@ -40,7 +40,7 @@ breaking changes may land in a minor release.
   A same-name `.bmad-loop/profiles/claude.toml` overlay replaces the packaged profile and
   stays unpinned until it adds `session_id_flag = "--session-id"`. A claude run paused
   before upgrading reports the host-exec config changed on resume: its launched argv
-  gained `--session-id`.
+  gained `--session-id`. Dry-run previews show the flag as `--session-id <auto>`.
 
 ## [0.13.0] — 2026-09-28
 
