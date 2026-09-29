@@ -7,7 +7,8 @@ module — and this module cannot import it back, since it ships as package DATA
 rather than as an importable module. Hence a twin rather than shared code:
 ``_LINK_REPARSE_TAGS``, ``_first_workspace``, ``_notification_type``,
 ``_source``, the DW-507 lineage block (``_LAUNCH_SHIM_WINDOW_S``,
-``_proc_stat``, ``_cmdline``, ``_lineage``), ``_is_link_like``,
+``_proc_stat``, ``_cmdline``, ``_HOOK_SHELLS``, ``_runs_relay``,
+``_is_hook_wrapper``, ``_lineage``), ``_is_link_like``,
 ``_write_all`` and ``_write_event`` below are byte-identical copies of the
 hook's, pinned that way by
 ``tests/test_events.py::test_the_twinned_source_is_identical`` — which
@@ -105,17 +106,65 @@ def _proc_stat(pid):
 
 
 def _cmdline(pid):
-    # The process's argv as one space-joined string; "" when it cannot be read.
-    path = f"/proc/{pid}/cmdline"  # portability: Linux-only; absent elsewhere -> ""
+    # The process's argv; [] when it cannot be read.
+    path = f"/proc/{pid}/cmdline"  # portability: Linux-only; absent elsewhere -> []
     try:
         with open(path, "rb") as handle:
             data = handle.read()
     except (OSError, ValueError):
-        return ""
-    return data.replace(b"\0", b" ").decode("utf-8", "replace")
+        return []
+    if not data:
+        return []
+    return [arg.decode("utf-8", "replace") for arg in data.rstrip(b"\0").split(b"\0")]
 
 
-def _lineage(event_name, marker):
+# Shells a hook host runs a registered hook command under (`<shell> -c <command>`),
+# by basename; a login shell's argv[0] carries a leading "-".
+_HOOK_SHELLS = frozenset({"sh", "bash", "dash", "zsh", "ksh", "mksh", "ash", "fish"})
+
+
+def _runs_relay(words, event_name, invocation):
+    # Whether `words` hold `invocation` then `event_name` as consecutive words:
+    # its program by basename (`/opt/bin/bmad-loop`), the rest literally.
+    program, rest = invocation[0], [*invocation[1:], event_name]
+    for index, word in enumerate(words):
+        if word.rsplit("/", 1)[-1] == program and words[index + 1 : index + 1 + len(rest)] == rest:
+            return True
+    return False
+
+
+def _is_hook_wrapper(argv, event_name, invocation):
+    """Whether a process between the relay and the launched CLI only runs the
+    registered hook command (DW-507), read structurally from its argv:
+      - a process whose argv ENDS in the relay invocation and the event name
+        (`uv run --no-project python .../bmad_loop_hook.py Stop`), or
+      - a shell (`_HOOK_SHELLS`) whose `-c` command string holds them as
+        consecutive words, split on whitespace, quotes and shell operators (so
+        `sh -c '.../bmad-loop relay Stop && true'` counts).
+    Nothing else in the argv is read: a nested CLI whose prompt, or whose
+    launching shell's command, merely names the relay is not a wrapper — the
+    nested CLI itself is never a shell running a `-c` string."""
+    tail = argv[-len(invocation) - 1 :]
+    if len(tail) == len(invocation) + 1 and _runs_relay(tail, event_name, invocation):
+        return True
+    if not argv or argv[0].rsplit("/", 1)[-1].lstrip("-") not in _HOOK_SHELLS:
+        return False
+    args = iter(argv[1:])
+    for arg in args:
+        if not arg.startswith(("-", "+")) or arg == "--":
+            return False  # an operand before -c: a script file, not a command string
+        if arg.startswith("-") and not arg.startswith("--") and "c" in arg[1:]:
+            break
+    else:
+        return False
+    for arg in args:
+        if not arg.startswith(("-", "+")):
+            words = [word for word in re.split(r"[\s;&|()<>'\"`]+", arg) if word]
+            return _runs_relay(words, event_name, invocation)
+    return False
+
+
+def _lineage(event_name, invocation):
     """Whether the process that fired this hook is the CLI bmad-loop launched
     (DW-507): "match", "mismatch", or "unknown".
 
@@ -130,9 +179,9 @@ def _lineage(event_name, marker):
         and the CLI its child; a node shim's real binary is a child again.
         Whatever the CLI starts at launch (MCP servers, a SessionStart hook
         running another CLI) is inside the window too and reads "match".
-      - a hook-command wrapper: its cmdline holds `marker` as a substring and
-        the event name as a whole token, split on whitespace, quotes and shell
-        operators (so `sh -c '.../bmad-loop relay Stop && true'` counts).
+      - a hook-command wrapper running this relay's `invocation` (its program's
+        basename, then its literal words) for this event: see
+        `_is_hook_wrapper`.
     Any other process on the way is a nested CLI or its shell: "mismatch". So
     is reaching pid 1 or below without meeting the launched pid while it is
     alive: a process from another tree.
@@ -172,8 +221,7 @@ def _lineage(event_name, marker):
             if 0 <= started - launch[1] <= chain_window:
                 pid = parent
                 continue
-            cmdline = _cmdline(pid)
-            if marker in cmdline and event_name in re.split(r"[\s;&|()<>'\"`]+", cmdline):
+            if _is_hook_wrapper(_cmdline(pid), event_name, invocation):
                 pid = parent
                 continue
             return "mismatch"
@@ -396,7 +444,7 @@ def relay(event_name: str, stdin: IO[str]) -> int:
         return 0
     ts = time.time_ns()
     event = shape_event(
-        ts, event_name, task_id, _read_payload(stdin), _lineage(event_name, "bmad-loop")
+        ts, event_name, task_id, _read_payload(stdin), _lineage(event_name, ("bmad-loop", "relay"))
     )
     # $BMAD_LOOP_EVENTS_DIR when the orchestrator names one (#494 moved the
     # channel out of the project tree), else the legacy in-tree location — the

@@ -43,6 +43,9 @@ TWINNED = (
     "_LAUNCH_SHIM_WINDOW_S",
     "_proc_stat",
     "_cmdline",
+    "_HOOK_SHELLS",
+    "_runs_relay",
+    "_is_hook_wrapper",
     "_lineage",
     "_is_link_like",
     "_write_all",
@@ -268,12 +271,13 @@ def test_both_relay_twins_forward_the_session_start_source(
 L = 100
 L_START = 1_000
 TICKS = 100
-WRAP = "sh -c /opt/bin/bmad-loop relay Stop"
+WRAP = ["sh", "-c", "/opt/bin/bmad-loop relay Stop"]
+RELAY = ("bmad-loop", "relay")
 
 
 def _fake_table(monkeypatch, table, parent, launch_pid=L, ticks=TICKS):
     """Point `events._lineage` at `table` with the relay's parent `parent`."""
-    table = {L: (1, L_START, "node /usr/bin/codex"), **table}
+    table = {L: (1, L_START, ["node", "/usr/bin/codex"]), **table}
     if launch_pid is None:
         monkeypatch.delenv("BMAD_LOOP_LAUNCH_PID", raising=False)
     else:
@@ -281,7 +285,7 @@ def _fake_table(monkeypatch, table, parent, launch_pid=L, ticks=TICKS):
     monkeypatch.setattr(events.os, "getppid", lambda: parent)
     monkeypatch.setattr(events.os, "sysconf", lambda name: ticks, raising=False)
     monkeypatch.setattr(events, "_proc_stat", lambda pid: table[pid][:2] if pid in table else None)
-    monkeypatch.setattr(events, "_cmdline", lambda pid: table[pid][2] if pid in table else "")
+    monkeypatch.setattr(events, "_cmdline", lambda pid: table[pid][2] if pid in table else [])
 
 
 @pytest.mark.parametrize(
@@ -290,14 +294,20 @@ def _fake_table(monkeypatch, table, parent, launch_pid=L, ticks=TICKS):
         pytest.param({}, L, "match", id="direct-hook"),
         pytest.param({200: (L, 90_000, WRAP)}, 200, "match", id="shell-wrapped"),
         pytest.param(
-            {200: (201, 90_000, WRAP), 201: (L, 90_000, "bash -c " + WRAP)},
+            {
+                200: (201, 90_000, WRAP),
+                201: (L, 90_000, ["bash", "-c", "sh -c '/opt/bin/bmad-loop relay Stop'"]),
+            },
             200,
             "match",
             id="wrapped-twice",
         ),
-        pytest.param({300: (L, L_START + 200, "codex-bin")}, 300, "match", id="launch-shim"),
+        pytest.param({300: (L, L_START + 200, ["codex-bin"])}, 300, "match", id="launch-shim"),
         pytest.param(
-            {300: (301, L_START + 300, "codex-bin"), 301: (L, L_START + 100, "node codex-shim")},
+            {
+                300: (301, L_START + 300, ["codex-bin"]),
+                301: (L, L_START + 100, ["node", "codex-shim"]),
+            },
             300,
             "match",
             id="launch-chain-two-levels",
@@ -305,85 +315,122 @@ def _fake_table(monkeypatch, table, parent, launch_pid=L, ticks=TICKS):
         pytest.param(
             {
                 200: (300, 90_000, WRAP),
-                300: (301, L_START + 300, "codex-bin"),
-                301: (L, L_START + 100, "node codex-shim"),
+                300: (301, L_START + 300, ["codex-bin"]),
+                301: (L, L_START + 100, ["node", "codex-shim"]),
             },
             200,
             "match",
             id="wrapped-hook-under-a-two-level-launch-chain",
         ),
         pytest.param(
-            {300: (301, L_START + 501, "codex-bin"), 301: (L, L_START + 100, "node codex-shim")},
+            {
+                300: (301, L_START + 501, ["codex-bin"]),
+                301: (L, L_START + 100, ["node", "codex-shim"]),
+            },
             300,
             "mismatch",
             id="launch-chain-grandchild-started-too-late",
         ),
         pytest.param(
-            {200: (L, 90_000, "sh -c /opt/bin/bmad-loop relay Stop; exit $?")},
+            {200: (L, 90_000, ["sh", "-c", "/opt/bin/bmad-loop relay Stop; exit $?"])},
             200,
             "match",
             id="wrapper-then-semicolon",
         ),
         pytest.param(
-            {200: (L, 90_000, "sh -c /opt/bin/bmad-loop relay Stop && true")},
+            {200: (L, 90_000, ["sh", "-c", "/opt/bin/bmad-loop relay Stop && true"])},
             200,
             "match",
             id="wrapper-then-and-list",
         ),
         pytest.param(
-            {200: (L, 90_000, "sh -c '/opt/my dir/bmad-loop' relay 'Stop'")},
+            {200: (L, 90_000, ["sh", "-c", "'/opt/my dir/bmad-loop' relay 'Stop'"])},
             200,
             "match",
             id="wrapper-with-a-quoted-relay-path",
         ),
         pytest.param(
-            {200: (L, 90_000, 'sh -c "/opt/bin/bmad-loop" relay "Stop"&&true')},
+            {200: (L, 90_000, ["sh", "-c", '"/opt/bin/bmad-loop" relay "Stop"&&true'])},
             200,
             "match",
             id="wrapper-double-quoted-no-spaces",
         ),
         pytest.param(
-            {300: (L, L_START + 500, "codex-bin")}, 300, "match", id="launch-shim-at-window-edge"
+            {300: (L, L_START + 500, ["codex-bin"])}, 300, "match", id="launch-shim-at-window-edge"
         ),
         pytest.param(
-            {200: (300, 90_000, WRAP), 300: (L, L_START + 3, "codex-bin")},
+            {200: (300, 90_000, WRAP), 300: (L, L_START + 3, ["codex-bin"])},
             200,
             "match",
             id="wrapped-hook-under-a-shim",
         ),
         pytest.param(
-            {300: (L, L_START + 501, "codex-bin")}, 300, "mismatch", id="shim-started-too-late"
+            {300: (L, L_START + 501, ["codex-bin"])}, 300, "mismatch", id="shim-started-too-late"
         ),
         pytest.param(
-            {300: (L, L_START - 1, "codex-bin")}, 300, "mismatch", id="shim-started-before-L"
+            {300: (L, L_START - 1, ["codex-bin"])}, 300, "mismatch", id="shim-started-before-L"
         ),
         pytest.param(
             {
                 200: (400, 90_000, WRAP),
-                400: (500, 90_000, "node /usr/bin/claude -p hi"),
-                500: (L, 80_000, "bash -c claude -p hi"),
+                400: (500, 90_000, ["node", "/usr/bin/claude", "-p", "hi"]),
+                500: (L, 80_000, ["bash", "-c", "claude -p hi"]),
             },
             200,
             "mismatch",
             id="nested-cli",
         ),
         pytest.param(
-            {400: (L, 90_000, "node /usr/bin/claude -p hi")},
+            {400: (L, 90_000, ["node", "/usr/bin/claude", "-p", "hi"])},
             400,
             "mismatch",
             id="nested-cli-execd-by-L-long-after-launch",
         ),
         pytest.param(
-            {200: (L, 90_000, "sh -c /opt/bin/bmad-loop relay Stopped")},
+            {200: (L, 90_000, ["sh", "-c", "/opt/bin/bmad-loop relay Stopped"])},
             200,
             "mismatch",
             id="event-name-must-be-a-whole-word",
         ),
         pytest.param(
-            {200: (L, 90_000, "sh -c /opt/bin/other relay Stop")},
+            {200: (L, 90_000, ["sh", "-c", "/opt/bin/other relay Stop"])},
             200,
             "mismatch",
             id="wrapper-needs-the-marker",
+        ),
+        pytest.param(
+            {
+                200: (400, 90_000, WRAP),
+                400: (500, 90_000, ["node", "/usr/bin/claude", "-p", "run bmad-loop relay Stop"]),
+                500: (L, 80_000, ["bash", "-c", "claude -p 'run bmad-loop relay Stop'"]),
+            },
+            200,
+            "mismatch",
+            id="nested-cli-whose-prompt-names-the-relay",
+        ),
+        pytest.param(
+            {400: (L, 90_000, ["claude", "-c", "/opt/bin/bmad-loop relay Stop"])},
+            400,
+            "mismatch",
+            id="non-shell-with-a-dash-c-argument",
+        ),
+        pytest.param(
+            {400: (L, 90_000, ["bash", "/tmp/cli.sh", "-c", "/opt/bin/bmad-loop relay Stop"])},
+            400,
+            "mismatch",
+            id="shell-running-a-script-file",
+        ),
+        pytest.param(
+            {200: (L, 90_000, ["sh", "-c", "/opt/bin/bmad-loop relay; echo Stop"])},
+            200,
+            "mismatch",
+            id="relay-words-must-be-consecutive",
+        ),
+        pytest.param(
+            {200: (L, 90_000, ["-bash", "-lc", "/opt/bin/bmad-loop relay Stop"])},
+            200,
+            "match",
+            id="login-shell-with-an-option-cluster",
         ),
         pytest.param({200: (1, 90_000, WRAP)}, 200, "mismatch", id="other-tree-reaches-init"),
         pytest.param({}, 1, "mismatch", id="detached-child-parent-is-init"),
@@ -399,18 +446,54 @@ def _fake_table(monkeypatch, table, parent, launch_pid=L, ticks=TICKS):
 )
 def test_lineage_tags_every_row_of_the_process_table(monkeypatch, table, parent, expected):
     """DW-507: `_lineage` over a fake `/proc`, one case per Tag row of the spec.
-    The walk skips only hook-command wrappers (marker as a substring, event name
-    as a token split on whitespace, quotes and shell operators) and the launch
-    chain (any process started within 5 s of L, at any depth — a forking fish
-    and a node shim stack two levels); anything else on the way is a nested CLI.
+    The walk skips only hook-command wrappers (a shell whose `-c` string holds
+    the relay invocation and event name as consecutive words, split on
+    whitespace, quotes and shell operators) and the launch chain (any process
+    started within 5 s of L, at any depth — a forking fish and a node shim stack
+    two levels); anything else on the way is a nested CLI.
 
     Ablation: drop the launch-chain arm and the shim/chain rows fail; restrict
     it to L's direct children and the two-level rows fail; drop the wrapper arm
-    and the wrapped rows fail; split the cmdline on whitespace only and the
+    and the wrapped rows fail; split the `-c` string on whitespace only and the
     `;`/`&&`/quoted rows fail; make it a plain "L is an ancestor" test and the
-    nested-cli row tags "match"."""
+    nested-cli row tags "match"; match the marker anywhere in the joined argv
+    (the old rule) and the nested-cli-whose-prompt-names-the-relay, non-shell
+    and script-file rows tag "match"."""
     _fake_table(monkeypatch, table, parent)
-    assert events._lineage("Stop", "bmad-loop") == expected
+    assert events._lineage("Stop", RELAY) == expected
+
+
+@pytest.mark.parametrize(
+    ("argv", "expected"),
+    [
+        pytest.param(
+            ["uv", "run", "--no-project", "python", "/p/.bmad-loop/bmad_loop_hook.py", "Stop"],
+            "match",
+            id="legacy-uv-runner-ends-in-the-invocation",
+        ),
+        pytest.param(
+            ["uv", "run", "python", "/p/.bmad-loop/bmad_loop_hook.py", "Stop", "--extra"],
+            "mismatch",
+            id="invocation-not-at-the-end",
+        ),
+        pytest.param(
+            ["node", "/usr/bin/claude", "-p", "see /p/.bmad-loop/bmad_loop_hook.py Stop now"],
+            "mismatch",
+            id="prompt-naming-the-hook-script",
+        ),
+    ],
+)
+def test_lineage_skips_a_runner_whose_argv_ends_in_the_hook_invocation(monkeypatch, argv, expected):
+    """DW-507: the copied hook's legacy registration (`uv run --no-project python
+    .../bmad_loop_hook.py Stop`) puts a non-shell runner between the hook and the
+    CLI; it is a wrapper because its argv ENDS in the invocation, not because it
+    holds those words anywhere.
+
+    Ablation: drop the argv-tail arm of `_is_hook_wrapper` and the uv row tags
+    "mismatch"; scan the whole argv instead of its tail and the other rows tag
+    "match"."""
+    _fake_table(monkeypatch, {200: (L, 90_000, argv)}, 200)
+    assert events._lineage("Stop", ("bmad_loop_hook.py",)) == expected
 
 
 @pytest.mark.parametrize(
@@ -428,13 +511,13 @@ def test_lineage_tags_every_row_of_the_process_table(monkeypatch, table, parent,
 def test_lineage_is_unknown_when_the_launch_pid_cannot_be_read(monkeypatch, value, stat_of_l):
     monkeypatch.setattr(events.os, "getppid", lambda: L)
     monkeypatch.setattr(events, "_proc_stat", lambda pid: (1, L_START) if stat_of_l else None)
-    monkeypatch.setattr(events, "_cmdline", lambda pid: "")
+    monkeypatch.setattr(events, "_cmdline", lambda pid: [])
     monkeypatch.setattr(events.os, "sysconf", lambda name: TICKS, raising=False)
     if value is None:
         monkeypatch.delenv("BMAD_LOOP_LAUNCH_PID", raising=False)
     else:
         monkeypatch.setenv("BMAD_LOOP_LAUNCH_PID", value)
-    assert events._lineage("Stop", "bmad-loop") == "unknown"
+    assert events._lineage("Stop", RELAY) == "unknown"
 
 
 def test_lineage_is_unknown_when_clock_ticks_are_unreadable(monkeypatch):
@@ -443,7 +526,7 @@ def test_lineage_is_unknown_when_clock_ticks_are_unreadable(monkeypatch):
 
     _fake_table(monkeypatch, {}, L)
     monkeypatch.setattr(events.os, "sysconf", no_sysconf, raising=False)
-    assert events._lineage("Stop", "bmad-loop") == "unknown"
+    assert events._lineage("Stop", RELAY) == "unknown"
 
 
 def test_lineage_turns_any_unexpected_fault_into_unknown(monkeypatch):
@@ -456,7 +539,7 @@ def test_lineage_turns_any_unexpected_fault_into_unknown(monkeypatch):
 
     monkeypatch.setattr(events, "_cmdline", explode)
     monkeypatch.setattr(events, "_proc_stat", explode)
-    assert events._lineage("Stop", "bmad-loop") == "unknown"
+    assert events._lineage("Stop", RELAY) == "unknown"
 
 
 def test_proc_stat_splits_after_the_last_paren(tmp_path, monkeypatch):
@@ -536,7 +619,7 @@ def test_both_twins_tag_unknown_without_a_launch_pid(tmp_path, monkeypatch):
 
 def _past_the_launch_window() -> None:
     """Sleep until this process is older than the relays' launch window, so a
-    wrapper it spawns is skipped by the WRAPPER arm alone (its marker and event
+    wrapper it spawns is skipped by the WRAPPER arm alone (its invocation and event
     name) and never by the launch-chain arm (started within 5 s of L)."""
     ticks = os.sysconf("SC_CLK_TCK")
     started = events._proc_stat(os.getpid())
@@ -571,13 +654,13 @@ def _wrapped_lineage(tmp_path: Path, command: list[str]) -> str:
 
 
 @pytest.mark.skipif(not _HAS_PROC, reason="no /proc: lineage is unknown by construction")
-def test_hook_script_marker_matches_its_real_wrapped_call_site(tmp_path):
-    """DW-507: the copied hook's marker literal ("bmad_loop_hook") must match the
+def test_hook_script_invocation_matches_its_real_wrapped_call_site(tmp_path):
+    """DW-507: the copied hook's invocation literal ("bmad_loop_hook.py",) must match the
     command a hook host actually runs — `<python> <path>/bmad_loop_hook.py Stop`
     behind a shell that does not exec it. Past the launch window, only the
     wrapper arm can skip that shell.
 
-    Ablation: change the hook's marker literal and this tags "mismatch"."""
+    Ablation: change the hook's invocation literal and this tags "mismatch"."""
     assert _wrapped_lineage(tmp_path, [sys.executable, str(HOOK)]) == "match"
 
 
@@ -586,13 +669,13 @@ _RELAY_SCRIPT = Path(sys.executable).parent / "bmad-loop"
 
 @pytest.mark.skipif(not _HAS_PROC, reason="no /proc: lineage is unknown by construction")
 @pytest.mark.skipif(not _RELAY_SCRIPT.is_file(), reason="no bmad-loop console script beside python")
-def test_relay_marker_matches_its_real_wrapped_call_site(tmp_path):
-    """DW-507: `bmad-loop relay`'s marker literal ("bmad-loop") must match the
+def test_relay_invocation_matches_its_real_wrapped_call_site(tmp_path):
+    """DW-507: `bmad-loop relay`'s invocation literal ("bmad-loop", "relay") must match the
     command `init` registers — `<abs>/bmad-loop relay Stop` — behind a shell
     that does not exec it. Past the launch window, only the wrapper arm can skip
     that shell.
 
-    Ablation: change `relay()`'s marker literal and this tags "mismatch"."""
+    Ablation: change `relay()`'s invocation literal and this tags "mismatch"."""
     assert _wrapped_lineage(tmp_path, [str(_RELAY_SCRIPT), "relay"]) == "match"
 
 
