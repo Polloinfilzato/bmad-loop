@@ -5081,7 +5081,7 @@ def test_triage_returning_a_nested_null_container_refuses_without_crashing_the_r
     assert len(prompts) == 2
     assert "--feedback" not in prompts[0] and "--feedback" in prompts[1]
     feedback_path = prompts[1].split("--feedback ", 1)[1]
-    assert "bundles[0] not an object: NoneType" in open(feedback_path).read()
+    assert "bundles[0] not an object: NoneType" in Path(feedback_path).read_text(encoding="utf-8")
 
 
 def test_triage_returning_a_non_mapping_document_refuses_without_crashing_the_run(project):
@@ -5130,7 +5130,9 @@ def test_triage_returning_a_non_mapping_document_refuses_without_crashing_the_ru
     assert len(prompts) == 2
     assert "--feedback" not in prompts[0] and "--feedback" in prompts[1]
     feedback_path = prompts[1].split("--feedback ", 1)[1]
-    assert "triage result not a JSON object: list" in open(feedback_path).read()
+    assert "triage result not a JSON object: list" in Path(feedback_path).read_text(
+        encoding="utf-8"
+    )
     # nothing escaped `run()`: no crash record, and a refused triage classified
     # nothing, so the ledger it was reading is left exactly as it was
     assert _records(engine, "run-crash") == []
@@ -23027,7 +23029,9 @@ def test_migration_returning_a_non_mapping_document_refuses_without_crashing_the
     assert len(prompts) == 2
     assert "--feedback" not in prompts[0] and "--feedback" in prompts[1]
     feedback_path = prompts[1].split("--feedback ", 1)[1]
-    assert "migration result not a JSON object: list" in open(feedback_path).read()
+    assert "migration result not a JSON object: list" in Path(feedback_path).read_text(
+        encoding="utf-8"
+    )
     # nothing escaped `run()`, and the un-migrated ledger is left as it was
     assert _records(engine, "run-crash") == []
     assert project.deferred_work.read_text(encoding="utf-8") == LEGACY_LEDGER
