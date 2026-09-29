@@ -229,6 +229,12 @@ class SessionHandle:
     task_id: str
     native_id: str  # tmux window id, HTTP session id, ...
     launched_ns: int = 0  # wall-clock ns just before launch; floor for hook events
+    # The CLI session id the adapter chose at launch (DW-505) and passed via the
+    # profile's `session_id_flag`; seeds hook-event attribution
+    # (`signals.SessionAttribution(pinned_id=...)`). None = the profile declares
+    # no such flag, so attribution learns the id from the first SessionStart.
+    # Never persisted. Kept LAST so positional constructions stay valid.
+    pinned_session_id: str | None = None
 
 
 @dataclass(frozen=True)

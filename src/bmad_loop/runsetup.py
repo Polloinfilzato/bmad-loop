@@ -160,9 +160,11 @@ def config_digest(
       ``interactive_env`` and every token there traces back to one of
       ``binary`` / ``launch_args`` / ``bypass_args`` / ``model_flag`` /
       ``prompt_template`` / ``env`` on the *resolved* profile, or to
-      ``extra_args`` on the resolved adapter. The opencode-http builder reads a
-      strict SUBSET of those — ``_serve_argv`` takes ``binary``, ``launch_args``
-      and the adapter's ``extra_args`` and nothing else, and ``_session_env`` layers
+      ``extra_args`` on the resolved adapter — plus ``session_id_flag``, which
+      ``build_command`` appends (with a minted id) to the launched argv only.
+      The opencode-http builder reads a strict SUBSET of those — ``_serve_argv``
+      takes ``binary``, ``launch_args`` and the adapter's ``extra_args`` and
+      nothing else, and ``_session_env`` layers
       ``profile.env`` plus one *generated* variable, which the ``skill_tree``
       bullet below accounts for. See the union paragraph on why the subset does
       not narrow what is hashed.
@@ -412,6 +414,14 @@ def config_digest(
             # explicit override to no flags at all); json.dumps keeps them apart.
             "extra_args": None if cfg.extra_args is None else list(cfg.extra_args),
         }
+        # An argv FLAG `build_command` appends to the launched command with a
+        # minted session id (DW-505); not in interactive_argv, still launched.
+        # Hashed only when set: an unset flag adds no token, so leaving the key
+        # out keeps the payload byte-identical to a digest stamped before the
+        # field existed — a paused run resumed across the upgrade must not report
+        # a host-exec change its argv never had.
+        if prof.session_id_flag:
+            launch[role]["session_id_flag"] = prof.session_id_flag
     payload = {
         "verify_commands": list(policy.verify.commands),
         "plugins_enabled": sorted(policy.plugins.enabled),

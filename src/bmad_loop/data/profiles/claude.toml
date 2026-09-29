@@ -4,6 +4,11 @@ binary = "claude"
 prompt_template = "{prompt}"
 bypass_args = ["--permission-mode", "bypassPermissions"]
 model_flag = "--model"
+# Caller-chosen session id (DW-505): the adapter mints a UUID4 per launch and pins
+# hook-event attribution to it, so a nested child's SessionEnd is foreign even
+# without a SessionStart (DW-508). Probed on Claude Code 2.1.284 (zero-token tmux
+# probe, 2026-09-28): SessionStart's session_id equals the --session-id value.
+session_id_flag = "--session-id"
 usage_parser = "claude-jsonl"
 first_run_note = "run `claude` once in the project to accept workspace trust and hooks approval"
 skill_tree = ".claude/skills"

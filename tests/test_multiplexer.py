@@ -33,6 +33,7 @@ class StubMux(TerminalMultiplexer):
     def __init__(self):
         self.calls: list[str] = []
         self.window_env: dict[str, str] = {}
+        self.window_command = ""
         self._sessions: set[str] = set()
         self._windows: dict[str, list[str]] = {}
         self._next = 0
@@ -53,6 +54,7 @@ class StubMux(TerminalMultiplexer):
     def new_window(self, session, name, cwd, env, command):
         self.calls.append("new_window")
         self.window_env = env
+        self.window_command = command
         self._next += 1
         win = f"@stub{self._next}"
         self._windows.setdefault(session, []).append(win)
@@ -245,6 +247,64 @@ def test_generic_adapter_window_env_pins_the_state_root_over_profile(
     assert envvars.STATE_DIR not in adapter.interactive_env(spec)
     # ...and the rest of the profile/spec env is untouched
     assert stub.window_env["BMAD_LOOP_TASK_ID"] == spec.task_id
+
+
+def _launched(tmp_path, profile):
+    stub = StubMux()
+    adapter = GenericAdapter(
+        run_dir=tmp_path / "run",
+        policy=Policy(limits=LimitsPolicy()),
+        profile=profile,
+        mux=stub,
+        events_dir=tmp_path / "state" / "events",
+    )
+    spec = _spec(tmp_path)
+    handle = adapter.start_session(spec)
+    return adapter, spec, handle, shlex.split(stub.window_command)
+
+
+def test_generic_adapter_launches_claude_with_a_pinned_session_id(tmp_path, no_tmux):
+    """DW-505: the claude profile declares `session_id_flag`, so each launch mints
+    a UUID4, appends `--session-id <uuid>` at the END of the window command, and
+    carries it on the handle for attribution. Never in `interactive_argv` (the
+    human-present resolve path does no attribution)."""
+    import uuid
+
+    adapter, spec, handle, argv = _launched(tmp_path, get_profile("claude"))
+
+    pinned = handle.pinned_session_id
+    assert pinned is not None
+    assert uuid.UUID(pinned).version == 4
+    assert argv[-2:] == ["--session-id", pinned]
+    assert argv[:-2] == adapter.interactive_argv(spec)
+    assert "--session-id" not in adapter.interactive_argv(spec)
+
+    # a fresh id per launch
+    _, _, again, _ = _launched(tmp_path / "second", get_profile("claude"))
+    assert again.pinned_session_id != pinned
+
+
+@pytest.mark.parametrize("profile_name", ["codex", "gemini", "copilot"])
+def test_generic_adapter_without_session_id_flag_launches_unpinned(tmp_path, no_tmux, profile_name):
+    """A profile without `session_id_flag` keeps today's argv exactly and an
+    unpinned handle."""
+    profile = get_profile(profile_name)
+    assert profile.session_id_flag == ""
+    adapter, spec, handle, argv = _launched(tmp_path, profile)
+    assert handle.pinned_session_id is None
+    assert argv == adapter.interactive_argv(spec)
+
+
+def test_generic_adapter_empty_session_id_flag_launches_unpinned(tmp_path, no_tmux):
+    """An overlay that blanks claude's flag turns pinning off."""
+    import dataclasses
+
+    adapter, spec, handle, argv = _launched(
+        tmp_path, dataclasses.replace(get_profile("claude"), session_id_flag="")
+    )
+    assert handle.pinned_session_id is None
+    assert "--session-id" not in argv
+    assert argv == adapter.interactive_argv(spec)
 
 
 # --------------------------------------------------------------- seam honesty

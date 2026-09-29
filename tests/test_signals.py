@@ -463,3 +463,165 @@ def test_attribute_events_returns_admitted_and_foreign_ids():
     admitted, foreign = attribute_events(events)
     assert [(e.event, e.session_id) for e in admitted] == [("SessionStart", "A"), ("Stop", "A")]
     assert foreign == {"B", "C"}
+
+
+# DW-505/508: attribution pinned to the id the adapter chose at launch. One test
+# per row of the spec's I/O matrix; P is the pinned id.
+P = "pinned-P"
+
+
+def _replay(attribution, sequence):
+    return [
+        attribution.admit(_event(kind, sid, source=source[0] if source else None))
+        for kind, sid, *source in sequence
+    ]
+
+
+def test_pinned_attribution_admits_the_own_start():
+    attribution = SessionAttribution(pinned_id=P)
+    assert attribution.bound_id == P  # the pin binds before any event
+    assert _replay(attribution, [("SessionStart", P, "startup")]) == [True]
+    assert attribution.bound_id == P
+    assert attribution.foreign_ids == set()
+
+
+def test_pinned_attribution_drops_an_unannounced_child_session_end():
+    """DW-508: a child that never announced a SessionStart fires SessionEnd.
+    Unpinned this reads as the parent's own end; pinned, X is foreign.
+
+    Ablation guard: delete the pinned-only SessionEnd branch in `admit` and
+    End(X) is admitted again."""
+    attribution = SessionAttribution(pinned_id=P)
+    assert _replay(attribution, [("SessionStart", P), ("SessionEnd", "X")]) == [True, False]
+    assert attribution.foreign_ids == {"X"}
+    assert attribution.foreign_ended and not attribution.bound_ended
+
+
+def test_pinned_attribution_drops_an_unannounced_end_before_the_own_start():
+    attribution = SessionAttribution(pinned_id=P)
+    assert _replay(attribution, [("SessionEnd", "X")]) == [False]
+    assert attribution.foreign_ids == {"X"}
+
+
+def test_pinned_attribution_admits_the_own_pre_start_end():
+    """#727 under pinning: the launched CLI exiting before its SessionStart
+    fired still ends the session."""
+    attribution = SessionAttribution(pinned_id=P)
+    assert _replay(attribution, [("SessionEnd", P)]) == [True]
+    assert attribution.bound_ended
+    assert attribution.foreign_ids == set()
+
+
+def test_pinned_attribution_drops_a_child_start_and_its_stop():
+    attribution = SessionAttribution(pinned_id=P)
+    sequence = [("SessionStart", P), ("SessionStart", "C", "startup"), ("Stop", "C")]
+    assert _replay(attribution, sequence) == [True, False, False]
+    assert attribution.foreign_ids == {"C"}
+
+
+def test_pinned_attribution_follows_a_clear_rebind_and_admits_a_late_own_end():
+    """The #767 rebind still works pinned, and every id ever bound stays the
+    launched session's own: a late SessionEnd from the pre-clear id is admitted."""
+    attribution = SessionAttribution(pinned_id=P)
+    sequence = [
+        ("SessionStart", P),
+        ("SessionEnd", P),
+        ("SessionStart", "N", "clear"),
+        ("Stop", "N"),
+        ("SessionEnd", P),  # late, from the rotated-away own id
+    ]
+    assert _replay(attribution, sequence) == [True] * 5
+    assert attribution.bound_id == "N"
+    assert attribution.foreign_ids == set()
+
+
+def test_pinned_attribution_treats_a_clear_after_a_foreign_end_as_the_child():
+    attribution = SessionAttribution(pinned_id=P)
+    sequence = [("SessionStart", P), ("SessionEnd", "X"), ("SessionStart", "Y", "clear")]
+    assert _replay(attribution, sequence) == [True, False, False]
+    assert attribution.bound_id == P
+    assert attribution.foreign_ids == {"X", "Y"}
+
+
+def test_pinned_attribution_anonymous_start_does_not_unpin():
+    attribution = SessionAttribution(pinned_id=P)
+    assert _replay(attribution, [("SessionStart", None), ("SessionEnd", "X")]) == [True, False]
+    assert attribution.bound_id == P
+    assert attribution.foreign_ids == {"X"}
+
+
+def test_pinned_attribution_a_first_start_from_another_id_is_foreign():
+    """Pinned, the first SessionStart does not claim the parent slot: an id other
+    than the pin announcing first is a child, and the pin still binds."""
+    attribution = SessionAttribution(pinned_id=P)
+    sequence = [("SessionStart", "C", "startup"), ("Stop", "C"), ("SessionStart", P)]
+    assert _replay(attribution, sequence) == [False, False, True]
+    assert attribution.bound_id == P
+    assert attribution.foreign_ids == {"C"}
+
+
+def test_pinned_attribution_follows_a_compact_rebind():
+    attribution = SessionAttribution(pinned_id=P)
+    sequence = [("SessionStart", P), ("SessionStart", "K", "compact"), ("Stop", "K")]
+    assert _replay(attribution, sequence) == [True, True, True]
+    assert attribution.bound_id == "K"
+    assert attribution.foreign_ids == set()
+
+
+def test_pinned_attribution_a_resume_start_from_a_new_id_is_foreign():
+    """A nested child launched with --resume stays foreign under a pin."""
+    attribution = SessionAttribution(pinned_id=P)
+    sequence = [("SessionStart", P), ("SessionStart", "R", "resume"), ("Stop", "R")]
+    assert _replay(attribution, sequence) == [True, False, False]
+    assert attribution.bound_id == P
+    assert attribution.foreign_ids == {"R"}
+
+
+def test_pinned_attribution_a_second_clear_rebinds_and_keeps_every_own_id():
+    """Two clears in a row: the binding follows each, and a late SessionEnd from
+    either earlier own id (the pin, the first rebind) is still admitted."""
+    attribution = SessionAttribution(pinned_id=P)
+    sequence = [
+        ("SessionStart", P),
+        ("SessionEnd", P),
+        ("SessionStart", "N", "clear"),
+        ("SessionEnd", "N"),
+        ("SessionStart", "M", "clear"),
+        ("Stop", "M"),
+        ("SessionEnd", P),  # late
+        ("SessionEnd", "N"),  # late
+    ]
+    assert _replay(attribution, sequence) == [True] * len(sequence)
+    assert attribution.bound_id == "M"
+    assert attribution.foreign_ids == set()
+
+
+def test_pinned_attribution_admits_id_less_events():
+    attribution = SessionAttribution(pinned_id=P)
+    assert _replay(attribution, [("SessionEnd", None), ("Stop", None)]) == [True, True]
+    assert attribution.foreign_ids == set()
+
+
+def test_pinned_attribution_admits_an_unannounced_stop():
+    """Only SessionStart/SessionEnd go foreign on the pin: a never-announced id's
+    Stop (a Copilot toolu_ subagent Stop) is still admitted."""
+    attribution = SessionAttribution(pinned_id=P)
+    assert _replay(attribution, [("SessionStart", P), ("Stop", "toolu_1")]) == [True, True]
+    assert attribution.foreign_ids == set()
+
+
+@pytest.mark.parametrize(
+    "sequence",
+    [
+        pytest.param([("SessionEnd", "X")], id="unannounced-end-first"),
+        pytest.param(
+            [("SessionStart", "A"), ("SessionEnd", "X")], id="unannounced-end-after-start"
+        ),
+    ],
+)
+def test_unpinned_attribution_still_admits_an_unannounced_end(sequence):
+    """Regression: without a pin the accepted limitation stands byte-for-byte."""
+    attribution = SessionAttribution()
+    assert _replay(attribution, sequence) == [True] * len(sequence)
+    assert attribution.foreign_ids == set()
+    assert not attribution.foreign_ended

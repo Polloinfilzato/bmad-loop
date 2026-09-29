@@ -17,6 +17,15 @@ breaking changes may land in a minor release.
   `timeout-fired`, and excluded from the sweep diagnostic (`hook_foreign_ids`). Forward
   SessionStart `source` so a `clear`/`compact` start rebinds; re-run `bmad-loop init` to
   re-vendor the relay (#767). Contributed by [@Pinstack](https://github.com/Pinstack).
+- Pin the launched session's id at launch for hook-event attribution: a new profile key
+  `session_id_flag` (claude: `--session-id`) makes the generic adapter pass a minted UUID4
+  and treat an identified `SessionStart`/`SessionEnd` from any id the session never had
+  as foreign (a `clear`/`compact` rebind still counts as its own), so a nested child's
+  `SessionEnd` without a prior `SessionStart` no longer crashes the parent (DW-505/508).
+  A same-name `.bmad-loop/profiles/claude.toml` overlay replaces the packaged profile and
+  stays unpinned until it adds `session_id_flag = "--session-id"`. A claude run paused
+  before upgrading reports the host-exec config changed on resume: its launched argv
+  gained `--session-id`.
 
 ## [0.13.0] — 2026-09-28
 

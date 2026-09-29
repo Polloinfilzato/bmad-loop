@@ -141,17 +141,45 @@ class SessionAttribution:
     clear start). A child that rotates its id without a preceding SessionEnd
     still rebinds; only a relay-side lineage check could tell it apart.
 
-    Accepted limitation: a child SessionEnd whose child never announced a
-    SessionStart is indistinguishable from the parent's own and is admitted.
-    Nested CLIs announce their start, so this is documented, not defended."""
+    Pinning (DW-505/508). When the adapter chose the launched session's id
+    itself — the profile's ``session_id_flag``, e.g. claude's ``--session-id`` —
+    it passes that id as ``pinned_id`` and the parent is known before any event
+    arrives. The first SessionStart then binds nothing (the pin already did);
+    every id ever bound — the pin plus each clear/compact rebind — is the
+    launched session's own, and an identified SessionStart or SessionEnd from any
+    other id is foreign. So a child that fires SessionEnd without ever announcing
+    a SessionStart is dropped instead of crashing the parent (DW-508), and an
+    unannounced SessionEnd before the parent's own start is foreign too, while
+    the parent's own pre-start SessionEnd (#727) is still admitted. Other events
+    (``Stop`` and the rest) from a never-announced id are still admitted — a
+    Copilot ``toolu_`` subagent Stop relies on that.
 
-    started: bool = False  # the launched session's first SessionStart was seen
+    Accepted limitation, unpinned only: without a pin, a child SessionEnd whose
+    child never announced a SessionStart is indistinguishable from the parent's
+    own and is admitted. Nested CLIs announce their start, so this is documented,
+    not defended. :func:`attribute_events` always replays unpinned, so the sweep
+    diagnostic keeps this limitation even for a pinned profile."""
+
+    started: bool = False  # the first SessionStart was seen (the parent's, when unpinned)
     bound_id: str | None = None  # its id (None when that start was anonymous)
     foreign_ids: set[str] = field(default_factory=set)
     # Which sessions ended since the last SessionStart: evidence for whose
     # "clear" start comes next.
     bound_ended: bool = False
     foreign_ended: bool = False
+    # The launched session's id, chosen by the adapter at launch (None = unpinned:
+    # the first SessionStart is the parent's). Seeds `bound_id`.
+    pinned_id: str | None = None
+    # Every id bound so far (the pin and each rebind): a late SessionEnd from an
+    # earlier own id is the launched session's, never foreign. Consulted only
+    # when pinned.
+    _own_ids: set[str] = field(default_factory=set, init=False, repr=False)
+
+    def __post_init__(self) -> None:
+        if self.pinned_id is not None:
+            if self.bound_id is None:
+                self.bound_id = self.pinned_id
+            self._own_ids.add(self.pinned_id)
 
     def admit(self, event: HookEvent) -> bool:
         """Whether ``event`` belongs to the launched session. Stateful: a
@@ -161,8 +189,12 @@ class SessionAttribution:
             bound_ended, foreign_ended = self.bound_ended, self.foreign_ended
             self.bound_ended = self.foreign_ended = False
             if not self.started:
-                self.started, self.bound_id = True, sid
-                return True
+                self.started = True
+                if self.pinned_id is None:  # unpinned: the first start is the parent's
+                    self.bound_id = sid
+                    if sid:
+                        self._own_ids.add(sid)
+                    return True
             if not sid or sid == self.bound_id:
                 return True
             if (
@@ -171,6 +203,7 @@ class SessionAttribution:
                 and not (event.source == "clear" and foreign_ended and not bound_ended)
             ):
                 self.bound_id = sid
+                self._own_ids.add(sid)
                 return True
             self.foreign_ids.add(sid)
             return False
@@ -179,12 +212,21 @@ class SessionAttribution:
                 self.bound_ended = True
             elif sid in self.foreign_ids:
                 self.foreign_ended = True
+            elif self.pinned_id is not None and sid not in self._own_ids:
+                # Pinned: an id that is not (and never was) the launched
+                # session's ends as a child, announced or not (DW-508).
+                self.foreign_ids.add(sid)
+                self.foreign_ended = True
         return not (sid and sid in self.foreign_ids)
 
 
 def attribute_events(events: list[HookEvent]) -> tuple[list[HookEvent], set[str]]:
     """Replay :class:`SessionAttribution` over an oldest-first snapshot (e.g.
-    :func:`session_events`): the admitted events, and every id found foreign."""
+    :func:`session_events`): the admitted events, and every id found foreign.
+
+    Always unpinned: the launch-time pinned id (DW-505) lives only on the live
+    ``SessionHandle`` and is not persisted, so this replay keeps the first-start
+    heuristic — and its unannounced-SessionEnd limitation — for every profile."""
     attribution = SessionAttribution()
     admitted = [event for event in events if attribution.admit(event)]
     return admitted, attribution.foreign_ids

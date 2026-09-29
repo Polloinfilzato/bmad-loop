@@ -420,6 +420,69 @@ def test_malformed_adapter_value_funnels_into_profile_error(tmp_path, value):
         load_profiles(tmp_path)
 
 
+# --------------------------------------------------------------------------- #
+# `session_id_flag` (DW-505: the CLI's launch flag for a caller-chosen session id)
+
+
+def test_only_claude_ships_a_session_id_flag():
+    """Claude Code honors `--session-id` (probed 2026-09-28); support in the other
+    CLIs is unverified, so they ship without one and attribution stays on the
+    first-start heuristic there."""
+    profiles = load_profiles()
+    assert profiles["claude"].session_id_flag == "--session-id"
+    others = {name: p.session_id_flag for name, p in profiles.items() if name != "claude"}
+    assert others and all(flag == "" for flag in others.values()), others
+
+
+def test_session_id_flag_defaults_empty_and_parses(tmp_path):
+    profiles_dir = tmp_path / ".bmad-loop" / "profiles"
+    profiles_dir.mkdir(parents=True)
+    (profiles_dir / "mycli.toml").write_text(MINIMAL_PROFILE)
+    assert load_profiles(tmp_path)["mycli"].session_id_flag == ""
+    (profiles_dir / "mycli.toml").write_text(
+        MINIMAL_PROFILE.replace("[hooks]", 'session_id_flag = "--sid"\n[hooks]')
+    )
+    assert load_profiles(tmp_path)["mycli"].session_id_flag == "--sid"
+
+
+@pytest.mark.parametrize(
+    ("value", "match"),
+    [
+        # shape: never `str()`-coerced into an argv token
+        ("5", "session_id_flag must be a string"),
+        ('["--session-id"]', "session_id_flag must be a string"),
+        ("true", "session_id_flag must be a string"),
+        # value: one option token, no whitespace, no `=` (the id is the next argv
+        # element, so `--session-id=` would launch as two tokens)
+        ('"session-id"', "option token"),
+        ('"--a b"', "option token"),
+        ('"--session-id "', "option token"),
+        ('"-"', "option token"),
+        ('"--"', "option token"),
+        ('"--session-id="', "option token"),
+    ],
+)
+def test_malformed_session_id_flag_is_a_profile_error(tmp_path, value, match):
+    profiles_dir = tmp_path / ".bmad-loop" / "profiles"
+    profiles_dir.mkdir(parents=True)
+    (profiles_dir / "bad.toml").write_text(
+        MINIMAL_PROFILE.replace("[hooks]", f"session_id_flag = {value}\n[hooks]")
+    )
+    with pytest.raises(ProfileError, match=match):
+        load_profiles(tmp_path)
+
+
+def test_hookless_profile_cannot_set_a_session_id_flag(tmp_path):
+    """A pin only filters hook events, and a hookless profile has none."""
+    profiles_dir = tmp_path / ".bmad-loop" / "profiles"
+    profiles_dir.mkdir(parents=True)
+    (profiles_dir / "bad.toml").write_text(
+        HOOKLESS_PROFILE.replace("[hooks]", 'session_id_flag = "--session-id"\n[hooks]')
+    )
+    with pytest.raises(ProfileError, match="must not set session_id_flag"):
+        load_profiles(tmp_path)
+
+
 def test_render_prompt_passthrough_and_template():
     claude = get_profile("claude")
     assert claude.render_prompt("/bmad-dev-auto 1-1-a") == "/bmad-dev-auto 1-1-a"
@@ -1152,6 +1215,16 @@ def test_profile_scan_failure_degrades(profile_scan):
         ({"adapter": " acme "}, "whitespace"),
         ({"name": " acme "}, "whitespace"),
         ({"binary": " acme "}, "whitespace"),
+        # a pin on a hookless profile, and a value that is not one option token
+        ({"session_id_flag": "--session-id"}, "session_id_flag"),
+        (
+            {
+                "adapter": "generic",
+                "hooks": HookSpec("claude-settings-json", ".m/s.json", {"Stop": "Stop"}),
+                "session_id_flag": "--a b",
+            },
+            "session_id_flag",
+        ),
     ],
 )
 def test_entry_point_profile_must_pass_the_parser_invariants(profile_scan, over, match):

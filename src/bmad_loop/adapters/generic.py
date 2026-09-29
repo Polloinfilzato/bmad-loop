@@ -32,6 +32,7 @@ import json
 import shlex
 import stat
 import time
+import uuid
 from collections.abc import Callable
 from dataclasses import dataclass
 from functools import cached_property
@@ -838,8 +839,16 @@ class GenericAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter):
         # the same rule.
         return runs.pin_state_root({**self.profile.env, **spec.env})
 
-    def build_command(self, spec: SessionSpec) -> str:
-        return " ".join(shlex.quote(a) for a in self.interactive_argv(spec))
+    def build_command(self, spec: SessionSpec, *, session_id: str | None = None) -> str:
+        """The launched window's command line. ``session_id`` (DW-505) is the id
+        ``start_session`` minted for a profile declaring ``session_id_flag``; it is
+        appended at the END, like ``model_flag``, so a ``launch_args`` ending in a
+        value-taking option (gemini's ``-i``) cannot swallow it. Deliberately not
+        in ``interactive_argv``: resolve's human-present sessions do no attribution."""
+        argv = self.interactive_argv(spec)
+        if session_id and self.profile.session_id_flag:
+            argv += [self.profile.session_id_flag, session_id]
+        return " ".join(shlex.quote(a) for a in argv)
 
     # --------------------------------------------------------------- adapter
 
@@ -884,6 +893,10 @@ class GenericAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter):
         # detection is unaffected: `_log_activity_key` reports (mtime, 0) instead of
         # None, and every reader compares signatures rather than testing existence.)
         log_file.touch()
+        # DW-505: a profile that can take a caller-chosen session id gets a fresh
+        # one per launch, so wait_for_completion knows the parent before any hook
+        # event arrives (signals.SessionAttribution pinning).
+        pinned_session_id = str(uuid.uuid4()) if self.profile.session_id_flag else None
         window_id = self.mux.new_window(
             self.session_name,
             spec.task_id[-40:],
@@ -891,13 +904,18 @@ class GenericAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter):
             # Same merge as interactive_env, same pin chokepoint: the profile's
             # [env] table must not move the window off this process's state root.
             runs.pin_state_root({**self.profile.env, **spec.env}),
-            self.build_command(spec),
+            self.build_command(spec, session_id=pinned_session_id),
         )
         # pipe_pane tolerates the window having already died (a CLI that crashes on
         # launch can take it down before the tee attaches); the dead window is then
         # reported as a crash in wait_for_completion.
         self.mux.pipe_pane(window_id, log_file)
-        return SessionHandle(task_id=spec.task_id, native_id=window_id, launched_ns=launched_ns)
+        return SessionHandle(
+            task_id=spec.task_id,
+            native_id=window_id,
+            launched_ns=launched_ns,
+            pinned_session_id=pinned_session_id,
+        )
 
     def wait_for_completion(self, handle: SessionHandle, spec: SessionSpec) -> SessionResult:
         deadline = time.monotonic() + spec.timeout_s
@@ -908,7 +926,9 @@ class GenericAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter):
         # wall clock stepped backward must not stretch the session).
         wall_deadline = time.time() + spec.timeout_s
         session_id: str | None = None
-        attribution = SessionAttribution()
+        # Pinned to the launch-time id when the profile declared one (DW-505);
+        # never seeds `session_id` below — that still comes from the events.
+        attribution = SessionAttribution(pinned_id=handle.pinned_session_id)
         # events dropped as a nested CLI's (heartbeat + timeout-fired carry the
         # count); the crumb fires once per foreign id, not once per event.
         foreign_hook_events = 0
@@ -1506,9 +1526,11 @@ class GenericAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter):
             # or transcript, set stop_seen, spend nudges or re-arm the stall
             # timer. Deny-list (signals.SessionAttribution): only an id that
             # announced its own SessionStart after the launched session's first
-            # one is foreign; unannounced ids and id-less events pass. Copilot
-            # toolu_ subagent Stops never announce, so they pass here and stay
-            # owned by the subagent filter below.
+            # one is foreign — and, when the launch pinned the id (DW-505,
+            # `session_id_flag`), any never-own id's SessionEnd even unannounced
+            # (DW-508); other unannounced events and id-less events pass. Copilot toolu_
+            # subagent Stops never announce, so they pass here and stay owned by
+            # the subagent filter below.
             if not attribution.admit(event):
                 foreign_hook_events += 1
                 # admit() only drops identified events, so session_id is set.

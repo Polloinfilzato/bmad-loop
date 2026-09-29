@@ -12,6 +12,7 @@ import dataclasses
 import hashlib
 import json
 import os
+import shlex
 import shutil
 import subprocess
 import sys
@@ -65,18 +66,25 @@ _EVENTS_LINE = 'ed="$BMAD_LOOP_EVENTS_DIR"'
 _LEGACY_EVENTS_LINE = 'ed="$BMAD_LOOP_RUN_DIR/events"'
 
 FAKE_CLI = """#!/bin/bash
-# fake CLI: last positional arg is the prompt; env comes from tmux -e
+# fake CLI: last positional arg is the prompt; env comes from tmux -e. A trailing
+# `--session-id <id>` (the claude profile's session_id_flag, DW-505) is the
+# caller-chosen session id: honor it as real claude does, else "fake-1".
+sid="fake-1"
+if [ "$#" -ge 2 ] && [ "${@: -2:1}" = "--session-id" ]; then
+    sid="${@: -1}"
+    set -- "${@:1:$(( $# - 2 ))}"
+fi
 prompt="${@: -1}"
 ts=$(date +%s%N)
 ed="$BMAD_LOOP_EVENTS_DIR"
 mkdir -p "$ed" "$BMAD_LOOP_RUN_DIR/tasks/$BMAD_LOOP_TASK_ID"
-printf '{"ts": %s, "event": "SessionStart", "task_id": "%s", "session_id": "fake-1"}' \\
-    "$ts" "$BMAD_LOOP_TASK_ID" > "$ed/$ts-$BMAD_LOOP_TASK_ID-SessionStart.json"
-echo "{\\"workflow\\": \\"auto-dev\\", \\"prompt\\": \\"$prompt\\"}" \\
+printf '{"ts": %s, "event": "SessionStart", "task_id": "%s", "session_id": "%s"}' \\
+    "$ts" "$BMAD_LOOP_TASK_ID" "$sid" > "$ed/$ts-$BMAD_LOOP_TASK_ID-SessionStart.json"
+echo "{\\"workflow\\": \\"auto-dev\\", \\"prompt\\": \\"$prompt\\", \\"fake_sid\\": \\"$sid\\"}" \\
     > "$BMAD_LOOP_RUN_DIR/tasks/$BMAD_LOOP_TASK_ID/result.json"
 ts2=$(( ts + 1 ))
-printf '{"ts": %s, "event": "Stop", "task_id": "%s", "session_id": "fake-1"}' \\
-    "$ts2" "$BMAD_LOOP_TASK_ID" > "$ed/$ts2-$BMAD_LOOP_TASK_ID-Stop.json"
+printf '{"ts": %s, "event": "Stop", "task_id": "%s", "session_id": "%s"}' \\
+    "$ts2" "$BMAD_LOOP_TASK_ID" "$sid" > "$ed/$ts2-$BMAD_LOOP_TASK_ID-Stop.json"
 sleep 60  # stay alive like an idle interactive session
 """
 
@@ -1577,6 +1585,131 @@ def test_wait_for_completion_ignores_child_end_after_unidentified_session_start(
     assert [(entry["hook_event"], entry["foreign_session_id"]) for entry in ignored] == [
         ("SessionStart", child_id)
     ]
+
+
+def _unannounced_child_end_run(tmp_path, monkeypatch, pinned_session_id):
+    """DW-508's stream: the parent starts, a nested child that never announced a
+    SessionStart fires SessionEnd, then the parent's own Stop. The done spec
+    lands with the parent's Stop (call 3), so a session the child's end crashed
+    at call 2 finds no artifact to grade."""
+    monkeypatch.setattr(generic, "RESULT_GRACE_S", 0.0)
+    monkeypatch.setattr(generic, "RESULT_POLL_S", 0.0)
+    adapter, impl = make_dev_adapter(tmp_path)
+    parent_id = pinned_session_id or "outer-session"
+
+    def flush_terminal_spec(call_n):
+        if call_n == 3:
+            (impl / "spec-3-1-foo.md").write_text(
+                "---\nstatus: done\n---\n\n## Auto Run Result\n\nStatus: done\n"
+            )
+
+    adapter.watcher = _ScriptedWatcher(
+        [
+            _hook_event("SessionStart", session_id=parent_id, transcript_path="/outer.jsonl"),
+            _hook_event("SessionEnd", session_id="nested-child", transcript_path="/child.jsonl"),
+            _stop_event("3-1-dev-1", parent_id, "/outer.jsonl"),
+        ],
+        on_call=flush_terminal_spec,
+    )
+    handle = SessionHandle(task_id="3-1-dev-1", native_id="@1", pinned_session_id=pinned_session_id)
+    return adapter, adapter.wait_for_completion(handle, _dev_spec(tmp_path))
+
+
+def test_wait_for_completion_pinned_drops_an_unannounced_child_session_end(tmp_path, monkeypatch):
+    """DW-505/508: with the launch-time id pinned on the handle, a nested child's
+    SessionEnd is foreign even though the child never announced a SessionStart,
+    so it neither crashes the parent nor re-points its identity.
+
+    Ablation guard: delete the pinned-only SessionEnd branch in
+    `SessionAttribution.admit` and this crashes like the unpinned twin below."""
+    pinned = str(uuid.uuid4())
+    adapter, result = _unannounced_child_end_run(tmp_path, monkeypatch, pinned)
+
+    assert result.status == "completed"
+    assert result.session_id == pinned
+    assert result.transcript_path == "/outer.jsonl"
+    ignored = [
+        entry
+        for entry in _lifecycle_lines(adapter)
+        if entry["event"] == "foreign-hook-event-ignored"
+    ]
+    assert [(entry["hook_event"], entry["foreign_session_id"]) for entry in ignored] == [
+        ("SessionEnd", "nested-child")
+    ]
+
+
+class _LaunchingUnitMux(_UnitMux):
+    """`_UnitMux` plus the launch ops `start_session` performs (the session
+    already exists, so no `new_session`); records the window command."""
+
+    def __init__(self):
+        super().__init__()
+        self.command = ""
+
+    def new_window(self, session, name, cwd, env, command):
+        self.command = command
+        return "@1"
+
+    def pipe_pane(self, window_id, log_file):
+        return None
+
+
+def test_pinned_id_from_start_session_drives_wait_for_completion(tmp_path, monkeypatch):
+    """DW-505/508 through ONE handle: the claude profile's `start_session` mints the
+    id, launches it as `--session-id <id>`, and `wait_for_completion` on the
+    RETURNED handle pins attribution to it — so an unannounced child SessionEnd is
+    dropped and crumbed while the parent's Stop completes the session."""
+    monkeypatch.setattr(generic, "RESULT_GRACE_S", 0.0)
+    monkeypatch.setattr(generic, "RESULT_POLL_S", 0.0)
+    mux = _LaunchingUnitMux()
+    adapter, impl = make_dev_adapter(tmp_path, mux=mux)
+    spec = _dev_spec(tmp_path)
+
+    handle = adapter.start_session(spec)
+    pinned = handle.pinned_session_id
+    assert pinned is not None
+    assert shlex.split(mux.command)[-2:] == ["--session-id", pinned]
+
+    def flush_terminal_spec(call_n):
+        if call_n == 3:
+            (impl / "spec-3-1-foo.md").write_text(
+                "---\nstatus: done\n---\n\n## Auto Run Result\n\nStatus: done\n"
+            )
+
+    adapter.watcher = _ScriptedWatcher(
+        [
+            _hook_event("SessionStart", session_id=pinned, transcript_path="/outer.jsonl"),
+            _hook_event("SessionEnd", session_id="nested-child", transcript_path="/child.jsonl"),
+            _stop_event(spec.task_id, pinned, "/outer.jsonl"),
+        ],
+        on_call=flush_terminal_spec,
+    )
+    result = adapter.wait_for_completion(handle, spec)
+
+    assert result.status == "completed"
+    assert result.session_id == pinned
+    ignored = [
+        entry
+        for entry in _lifecycle_lines(adapter)
+        if entry["event"] == "foreign-hook-event-ignored"
+    ]
+    assert [(entry["hook_event"], entry["foreign_session_id"]) for entry in ignored] == [
+        ("SessionEnd", "nested-child")
+    ]
+
+
+def test_wait_for_completion_unpinned_admits_an_unannounced_child_session_end(
+    tmp_path, monkeypatch
+):
+    """The same stream without a pin: the accepted limitation stands, so the
+    child's SessionEnd reads as the parent's own and crashes the session. Proves
+    the pin — not some other filter — is what drops it in the test above."""
+    adapter, result = _unannounced_child_end_run(tmp_path, monkeypatch, None)
+
+    assert result.status == "crashed"
+    assert not any(
+        entry["event"] == "foreign-hook-event-ignored" for entry in _lifecycle_lines(adapter)
+    )
 
 
 def test_wait_for_completion_foreign_start_never_repoints_transcript(tmp_path, monkeypatch):
@@ -4999,6 +5132,18 @@ def _write_fake_cli(tmp_path, script: str = FAKE_CLI):
     return fake
 
 
+def _assert_fake_session_id(adapter, result, fallback="fake-1"):
+    """The session id FAKE_CLI reported: under a profile declaring
+    ``session_id_flag`` (claude) it is the UUID4 the adapter minted and pinned
+    attribution to (DW-505) — the fake echoes it into result.json as ``fake_sid``
+    — and ``fallback`` otherwise."""
+    if adapter.profile.session_id_flag:
+        assert result.session_id == result.result_json["fake_sid"]
+        assert uuid.UUID(result.session_id).version == 4
+    else:
+        assert result.session_id == fallback
+
+
 @pytest.mark.skipif(not HAVE_TMUX, reason="tmux not available")
 @real_mux_e2e
 @pytest.mark.parametrize("profile_name", ["claude", "codex", "gemini"])
@@ -5032,7 +5177,7 @@ def test_tmux_end_to_end_with_fake_cli(tmp_path, profile_name):
     assert result.result_json["workflow"] == "auto-dev"
     # the fake echoes back the rendered prompt it received
     assert result.result_json["prompt"] == adapter.profile.render_prompt(spec.prompt)
-    assert result.session_id == "fake-1"
+    _assert_fake_session_id(adapter, result)
     # canonical prompt recorded for debugging
     assert (adapter.tasks_dir / "t-int-1" / "prompt.txt").read_text().strip() == spec.prompt
 
@@ -5075,7 +5220,7 @@ def test_tmux_reused_task_id_ignores_stale_artifacts(tmp_path):
 
     assert result.status == "completed"
     assert result.result_json["workflow"] == "auto-dev"  # fresh, not "STALE"
-    assert result.session_id == "fake-1"  # fresh session, not "old"
+    _assert_fake_session_id(adapter, result)  # fresh session, not "old"
 
 
 @pytest.mark.skipif(not HAVE_TMUX, reason="tmux not available")
@@ -5115,7 +5260,7 @@ def test_tmux_end_to_end_with_a_relay_that_only_knows_the_legacy_dir(tmp_path):
         subprocess.run(["tmux", "kill-session", "-t", adapter.session_name], capture_output=True)
 
     assert result.status == "completed"
-    assert result.session_id == "fake-1"
+    _assert_fake_session_id(adapter, result)
     # the premise, asserted rather than assumed: the events really did land in the
     # legacy location and nowhere else, so the completion came through the fallback
     assert list((adapter.run_dir / "events").glob("*.json"))
