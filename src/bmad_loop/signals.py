@@ -157,8 +157,8 @@ class SessionAttribution:
     "unknown" (unreadable: no ``/proc`` on Windows or macOS, an older
     orchestrator). The launched session's own first SessionStart calibrates it:
     unpinned, the first start is taken to be that one; pinned, it is the first
-    start the pin admits, so a child's start that wins the race to the events
-    dir is foreign and calibrates nothing. Tagged "match", lineage
+    identified start the pin admits, so a child's start that wins the race to the
+    events dir — identified or anonymous — calibrates nothing. Tagged "match", lineage
     is ``"trusted"`` and every later "mismatch" event is foreign — id-less ones
     too, and a "clear"/"compact" rotation that would otherwise rebind — its id
     joining ``foreign_ids`` and its SessionEnd setting ``foreign_ended``. Tagged
@@ -204,7 +204,7 @@ class SessionAttribution:
     # lineage own-id exemption (DW-507) reads it pinned or not.
     _own_ids: set[str] = field(default_factory=set, init=False, repr=False)
     # Lineage calibration, set on the launched session's own first SessionStart
-    # (DW-507): "trusted", "miscalibrated" or "unavailable"; None before it. Only
+    # (identified, when pinned) (DW-507): "trusted", "miscalibrated" or "unavailable"; None before it. Only
     # "trusted" acts.
     # Derived from the events, never passed in.
     lineage_state: str | None = field(default=None, init=False)
@@ -233,11 +233,13 @@ class SessionAttribution:
             return False
         if event.event == "SessionStart":
             own = self._admit_start(event)
-            if own and self.lineage_state is None:
+            if own and self.lineage_state is None and (sid or self.pinned_id is None):
                 # The launched session's own first start calibrates lineage. Pinned,
                 # a foreign start can arrive first (a child launched by a parallel
                 # SessionStart hook); the pin names it foreign, so it calibrates
-                # nothing and cannot lock the attempt out of a trusted lineage.
+                # nothing and cannot lock the attempt out of a trusted lineage. An
+                # anonymous start is admitted but proves nothing under a pin (it
+                # may be that child's), so only an identified own start calibrates.
                 self.lineage_state = _LINEAGE_CALIBRATION.get(event.lineage or "", "unavailable")
             return own
         if event.event == "SessionEnd" and sid:

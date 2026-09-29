@@ -822,3 +822,30 @@ def test_pinned_lineage_stays_uncalibrated_while_only_foreign_starts_arrive():
     ]
     assert _replay_tagged(attribution, sequence) == [False, True]
     assert attribution.lineage_state is None
+
+
+def test_pinned_lineage_skips_an_anonymous_start_and_calibrates_on_the_pinned_one():
+    """Pinned, an anonymous start is admitted (it may be the parent's) but proves
+    nothing: a child's id-less `mismatch` start that wins the race must not
+    calibrate lineage, so the parent's identified `match` start trusts it and the
+    child's later id-less `mismatch` Stop is dropped.
+
+    Ablation: calibrate on any admitted start and the state is "miscalibrated",
+    so the id-less Stop is admitted."""
+    attribution = SessionAttribution(pinned_id=P)
+    sequence = [
+        ("SessionStart", None, "startup", "mismatch"),
+        ("SessionStart", P, "startup", "match"),
+        ("Stop", None, None, "mismatch"),
+        ("Stop", P, None, "match"),
+    ]
+    assert _replay_tagged(attribution, sequence) == [True, True, False, True]
+    assert attribution.lineage_state == "trusted"
+
+
+def test_unpinned_lineage_still_calibrates_on_an_anonymous_first_start():
+    """Unpinned, the first start takes the parent's slot identified or not, and
+    calibrates lineage exactly as before."""
+    attribution = SessionAttribution()
+    assert _replay_tagged(attribution, [("SessionStart", None, "startup", "match")]) == [True]
+    assert attribution.lineage_state == "trusted"
