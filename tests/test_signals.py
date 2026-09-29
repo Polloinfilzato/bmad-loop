@@ -789,3 +789,36 @@ def test_pinned_and_trusted_lineage_drops_an_unannounced_mismatch_stop():
     assert _replay_tagged(attribution, sequence) == [True, False, True, True]
     assert attribution.lineage_state == "trusted"
     assert attribution.foreign_ids == {"X"}
+
+
+def test_pinned_lineage_calibrates_on_the_pinned_start_not_a_child_that_won_the_race():
+    """Pinned, a child's start can reach the events dir before the parent's (a
+    child launched by a parallel project SessionStart hook). The pin already names
+    that start foreign, so its `mismatch` tag must not calibrate lineage: the
+    parent's own `match` start does, and the child's later id-less `mismatch` Stop
+    is dropped instead of completing the parent.
+
+    Ablation: calibrate on the first SessionStart unconditionally and the state
+    is "miscalibrated", so the id-less Stop is admitted."""
+    attribution = SessionAttribution(pinned_id=P)
+    sequence = [
+        ("SessionStart", "C", "startup", "mismatch"),
+        ("SessionStart", P, "startup", "match"),
+        ("Stop", None, None, "mismatch"),
+        ("Stop", P, None, "match"),
+    ]
+    assert _replay_tagged(attribution, sequence) == [False, True, False, True]
+    assert attribution.lineage_state == "trusted"
+    assert attribution.foreign_ids == {"C"}
+
+
+def test_pinned_lineage_stays_uncalibrated_while_only_foreign_starts_arrive():
+    """No start the pin admits, no calibration: lineage is ignored (fails toward
+    acceptance) and the id-less event passes."""
+    attribution = SessionAttribution(pinned_id=P)
+    sequence = [
+        ("SessionStart", "C", "startup", "match"),
+        ("Stop", None, None, "mismatch"),
+    ]
+    assert _replay_tagged(attribution, sequence) == [False, True]
+    assert attribution.lineage_state is None

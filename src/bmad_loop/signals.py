@@ -155,8 +155,10 @@ class SessionAttribution:
     Lineage (DW-507). Each relay tags its event ``lineage`` "match" (the launched
     CLI fired the hook), "mismatch" (something else did — a nested CLI) or
     "unknown" (unreadable: no ``/proc`` on Windows or macOS, an older
-    orchestrator). The launched session's own first SessionStart calibrates it,
-    since that start precedes any child by construction: tagged "match", lineage
+    orchestrator). The launched session's own first SessionStart calibrates it:
+    unpinned, the first start is taken to be that one; pinned, it is the first
+    start the pin admits, so a child's start that wins the race to the events
+    dir is foreign and calibrates nothing. Tagged "match", lineage
     is ``"trusted"`` and every later "mismatch" event is foreign — id-less ones
     too, and a "clear"/"compact" rotation that would otherwise rebind — its id
     joining ``foreign_ids`` and its SessionEnd setting ``foreign_ended``. Tagged
@@ -165,7 +167,7 @@ class SessionAttribution:
     lineage is ``"unavailable"``. Either way lineage is ignored for the attempt
     and the rules above stand alone. Failing toward acceptance still holds: an
     event carrying one of the launched session's own ids is never made foreign
-    by lineage, and events before the first SessionStart ignore it (#727).
+    by lineage, and events before calibration ignore it (#727).
 
     Pinning (DW-505/508). When the adapter chose the launched session's id
     itself — the profile's ``session_id_flag``, e.g. claude's ``--session-id`` —
@@ -201,8 +203,9 @@ class SessionAttribution:
     # foreign. The unannounced-SessionEnd rule consults it only when pinned; the
     # lineage own-id exemption (DW-507) reads it pinned or not.
     _own_ids: set[str] = field(default_factory=set, init=False, repr=False)
-    # Lineage calibration, set on the first SessionStart (DW-507): "trusted",
-    # "miscalibrated" or "unavailable"; None before it. Only "trusted" acts.
+    # Lineage calibration, set on the launched session's own first SessionStart
+    # (DW-507): "trusted", "miscalibrated" or "unavailable"; None before it. Only
+    # "trusted" acts.
     # Derived from the events, never passed in.
     lineage_state: str | None = field(default=None, init=False)
 
@@ -229,28 +232,14 @@ class SessionAttribution:
                     self.foreign_ended = True
             return False
         if event.event == "SessionStart":
-            bound_ended, foreign_ended = self.bound_ended, self.foreign_ended
-            self.bound_ended = self.foreign_ended = False
-            if not self.started:
-                self.started = True
+            own = self._admit_start(event)
+            if own and self.lineage_state is None:
+                # The launched session's own first start calibrates lineage. Pinned,
+                # a foreign start can arrive first (a child launched by a parallel
+                # SessionStart hook); the pin names it foreign, so it calibrates
+                # nothing and cannot lock the attempt out of a trusted lineage.
                 self.lineage_state = _LINEAGE_CALIBRATION.get(event.lineage or "", "unavailable")
-                if self.pinned_id is None:  # unpinned: the first start is the parent's
-                    self.bound_id = sid
-                    if sid:
-                        self._own_ids.add(sid)
-                    return True
-            if not sid or sid == self.bound_id:
-                return True
-            if (
-                sid not in self.foreign_ids
-                and event.source in REBIND_SOURCES
-                and not (event.source == "clear" and foreign_ended and not bound_ended)
-            ):
-                self.bound_id = sid
-                self._own_ids.add(sid)
-                return True
-            self.foreign_ids.add(sid)
-            return False
+            return own
         if event.event == "SessionEnd" and sid:
             if sid == self.bound_id:
                 self.bound_ended = True
@@ -262,6 +251,32 @@ class SessionAttribution:
                 self.foreign_ids.add(sid)
                 self.foreign_ended = True
         return not (sid and sid in self.foreign_ids)
+
+    def _admit_start(self, event: HookEvent) -> bool:
+        """Whether a SessionStart is the launched session's; binds or rebinds it
+        when it is, and marks its id foreign when it is not."""
+        sid = event.session_id
+        bound_ended, foreign_ended = self.bound_ended, self.foreign_ended
+        self.bound_ended = self.foreign_ended = False
+        if not self.started:
+            self.started = True
+            if self.pinned_id is None:  # unpinned: the first start is the parent's
+                self.bound_id = sid
+                if sid:
+                    self._own_ids.add(sid)
+                return True
+        if not sid or sid == self.bound_id:
+            return True
+        if (
+            sid not in self.foreign_ids
+            and event.source in REBIND_SOURCES
+            and not (event.source == "clear" and foreign_ended and not bound_ended)
+        ):
+            self.bound_id = sid
+            self._own_ids.add(sid)
+            return True
+        self.foreign_ids.add(sid)
+        return False
 
 
 # What the launched session's first SessionStart lineage tag makes of lineage
