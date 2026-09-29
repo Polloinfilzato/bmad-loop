@@ -32,6 +32,7 @@ import json
 import shlex
 import stat
 import time
+import uuid
 from collections.abc import Callable
 from dataclasses import dataclass
 from functools import cached_property
@@ -47,7 +48,7 @@ from ..model import TokenUsage
 from ..mountpaths import rebased_project
 from ..policy import Policy
 from ..process_host import ProcessHostError, get_process_host
-from ..signals import SessionAttribution, SignalWatcher
+from ..signals import REBIND_SOURCES, SessionAttribution, SignalWatcher
 from ..tokens import read_usage as tally_usage
 from ..verify import read_frontmatter, status_of
 from .base import (
@@ -838,8 +839,16 @@ class GenericAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter):
         # the same rule.
         return runs.pin_state_root({**self.profile.env, **spec.env})
 
-    def build_command(self, spec: SessionSpec) -> str:
-        return " ".join(shlex.quote(a) for a in self.interactive_argv(spec))
+    def build_command(self, spec: SessionSpec, *, session_id: str | None = None) -> str:
+        """The launched window's command line. ``session_id`` (DW-505) is the id
+        ``start_session`` minted for a profile declaring ``session_id_flag``; it is
+        appended at the END, like ``model_flag``, so a ``launch_args`` ending in a
+        value-taking option (gemini's ``-i``) cannot swallow it. Deliberately not
+        in ``interactive_argv``: resolve's human-present sessions do no attribution."""
+        argv = self.interactive_argv(spec)
+        if session_id and self.profile.session_id_flag:
+            argv += [self.profile.session_id_flag, session_id]
+        return " ".join(shlex.quote(a) for a in argv)
 
     # --------------------------------------------------------------- adapter
 
@@ -884,6 +893,10 @@ class GenericAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter):
         # detection is unaffected: `_log_activity_key` reports (mtime, 0) instead of
         # None, and every reader compares signatures rather than testing existence.)
         log_file.touch()
+        # DW-505: a profile that can take a caller-chosen session id gets a fresh
+        # one per launch, so wait_for_completion knows the parent before any hook
+        # event arrives (signals.SessionAttribution pinning).
+        pinned_session_id = str(uuid.uuid4()) if self.profile.session_id_flag else None
         window_id = self.mux.new_window(
             self.session_name,
             spec.task_id[-40:],
@@ -891,13 +904,18 @@ class GenericAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter):
             # Same merge as interactive_env, same pin chokepoint: the profile's
             # [env] table must not move the window off this process's state root.
             runs.pin_state_root({**self.profile.env, **spec.env}),
-            self.build_command(spec),
+            self.build_command(spec, session_id=pinned_session_id),
         )
         # pipe_pane tolerates the window having already died (a CLI that crashes on
         # launch can take it down before the tee attaches); the dead window is then
         # reported as a crash in wait_for_completion.
         self.mux.pipe_pane(window_id, log_file)
-        return SessionHandle(task_id=spec.task_id, native_id=window_id, launched_ns=launched_ns)
+        return SessionHandle(
+            task_id=spec.task_id,
+            native_id=window_id,
+            launched_ns=launched_ns,
+            pinned_session_id=pinned_session_id,
+        )
 
     def wait_for_completion(self, handle: SessionHandle, spec: SessionSpec) -> SessionResult:
         deadline = time.monotonic() + spec.timeout_s
@@ -908,11 +926,24 @@ class GenericAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter):
         # wall clock stepped backward must not stretch the session).
         wall_deadline = time.time() + spec.timeout_s
         session_id: str | None = None
-        attribution = SessionAttribution()
+        # Pinned to the launch-time id when the profile declared one (DW-505);
+        # never seeds `session_id` below — that still comes from the events.
+        attribution = SessionAttribution(pinned_id=handle.pinned_session_id)
         # events dropped as a nested CLI's (heartbeat + timeout-fired carry the
-        # count); the crumb fires once per foreign id, not once per event.
+        # count); the crumb fires once per foreign id, not once per event — and
+        # once for all id-less drops, under the None key (DW-507).
         foreign_hook_events = 0
-        crumbed_foreign: set[str] = set()
+        crumbed_foreign: set[str | None] = set()
+        # DW-507: the one-shot crumb for a lineage the first SessionStart could
+        # not calibrate ("miscalibrated"/"unavailable"), so the degrade to the
+        # #767 rules alone is visible in session-lifecycle.jsonl.
+        lineage_crumbed = False
+        # DW-509: whether the CLI honoured the launch-time pin is settled by the
+        # first identified non-rebind SessionStart that is not a rejected
+        # "mismatch"-tagged (nested) one; unpinned, there is nothing to
+        # check. A mismatch leaves the launched session foreign to attribution
+        # (its Stop is dropped), so it is crumbed once instead of staying silent.
+        pin_checked = handle.pinned_session_id is None
         transcript_path: str | None = None
         nudges_left = self._stop_nudges
         # Positive grace arms at launch for dev/review sessions, so a CLI that
@@ -1506,19 +1537,59 @@ class GenericAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter):
             # or transcript, set stop_seen, spend nudges or re-arm the stall
             # timer. Deny-list (signals.SessionAttribution): only an id that
             # announced its own SessionStart after the launched session's first
-            # one is foreign; unannounced ids and id-less events pass. Copilot
-            # toolu_ subagent Stops never announce, so they pass here and stay
-            # owned by the subagent filter below.
-            if not attribution.admit(event):
+            # one is foreign — and, when the launch pinned the id (DW-505,
+            # `session_id_flag`), any never-own id's SessionEnd even unannounced
+            # (DW-508); other unannounced events and id-less events pass. Copilot toolu_
+            # subagent Stops never announce, so they pass here and stay owned by
+            # the subagent filter below. Once the relay-side lineage is trusted
+            # (DW-507), a "mismatch"-tagged event is foreign too, id-less or not.
+            admitted = attribution.admit(event)
+            if (
+                not lineage_crumbed
+                and attribution.lineage_state is not None
+                and attribution.lineage_state != "trusted"
+            ):
+                lineage_crumbed = True
+                self._note_lifecycle(
+                    handle.task_id,
+                    "hook-lineage-untrusted",
+                    reason=attribution.lineage_state,
+                    lineage=event.lineage,
+                )
+            if (
+                not pin_checked
+                and event.event == "SessionStart"
+                and event.session_id
+                and event.source not in REBIND_SOURCES
+                and (admitted or event.lineage != "mismatch")
+            ):
+                # Observation only: attribution has already judged the event. A
+                # rejected start the relay tagged "mismatch" is a nested CLI's
+                # (one launched by a parallel SessionStart hook can win the race
+                # to the events dir), not the CLI's answer to the pin, so it
+                # defers the check to the next start.
+                pin_checked = True
+                if event.session_id != handle.pinned_session_id:
+                    self._note_lifecycle(
+                        handle.task_id,
+                        "pinned-session-id-mismatch",
+                        pinned_session_id=handle.pinned_session_id,
+                        reported_session_id=event.session_id,
+                        source=event.source,
+                    )
+            if not admitted:
                 foreign_hook_events += 1
-                # admit() only drops identified events, so session_id is set.
-                if event.session_id and event.session_id not in crumbed_foreign:
-                    crumbed_foreign.add(event.session_id)
+                # Identified drops crumb once per id; id-less ones (only a trusted
+                # lineage mismatch drops those; "" counts as id-less) share the
+                # None key.
+                foreign_key = event.session_id or None
+                if foreign_key not in crumbed_foreign:
+                    crumbed_foreign.add(foreign_key)
                     self._note_lifecycle(
                         handle.task_id,
                         "foreign-hook-event-ignored",
                         hook_event=event.event,
-                        foreign_session_id=event.session_id,
+                        foreign_session_id=foreign_key,
                         dropped_so_far=foreign_hook_events,
                     )
                 continue

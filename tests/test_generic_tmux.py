@@ -12,6 +12,7 @@ import dataclasses
 import hashlib
 import json
 import os
+import shlex
 import shutil
 import subprocess
 import sys
@@ -65,18 +66,25 @@ _EVENTS_LINE = 'ed="$BMAD_LOOP_EVENTS_DIR"'
 _LEGACY_EVENTS_LINE = 'ed="$BMAD_LOOP_RUN_DIR/events"'
 
 FAKE_CLI = """#!/bin/bash
-# fake CLI: last positional arg is the prompt; env comes from tmux -e
+# fake CLI: last positional arg is the prompt; env comes from tmux -e. A trailing
+# `--session-id <id>` (the claude profile's session_id_flag, DW-505) is the
+# caller-chosen session id: honor it as real claude does, else "fake-1".
+sid="fake-1"
+if [ "$#" -ge 2 ] && [ "${@: -2:1}" = "--session-id" ]; then
+    sid="${@: -1}"
+    set -- "${@:1:$(( $# - 2 ))}"
+fi
 prompt="${@: -1}"
 ts=$(date +%s%N)
 ed="$BMAD_LOOP_EVENTS_DIR"
 mkdir -p "$ed" "$BMAD_LOOP_RUN_DIR/tasks/$BMAD_LOOP_TASK_ID"
-printf '{"ts": %s, "event": "SessionStart", "task_id": "%s", "session_id": "fake-1"}' \\
-    "$ts" "$BMAD_LOOP_TASK_ID" > "$ed/$ts-$BMAD_LOOP_TASK_ID-SessionStart.json"
-echo "{\\"workflow\\": \\"auto-dev\\", \\"prompt\\": \\"$prompt\\"}" \\
+printf '{"ts": %s, "event": "SessionStart", "task_id": "%s", "session_id": "%s"}' \\
+    "$ts" "$BMAD_LOOP_TASK_ID" "$sid" > "$ed/$ts-$BMAD_LOOP_TASK_ID-SessionStart.json"
+echo "{\\"workflow\\": \\"auto-dev\\", \\"prompt\\": \\"$prompt\\", \\"fake_sid\\": \\"$sid\\"}" \\
     > "$BMAD_LOOP_RUN_DIR/tasks/$BMAD_LOOP_TASK_ID/result.json"
 ts2=$(( ts + 1 ))
-printf '{"ts": %s, "event": "Stop", "task_id": "%s", "session_id": "fake-1"}' \\
-    "$ts2" "$BMAD_LOOP_TASK_ID" > "$ed/$ts2-$BMAD_LOOP_TASK_ID-Stop.json"
+printf '{"ts": %s, "event": "Stop", "task_id": "%s", "session_id": "%s"}' \\
+    "$ts2" "$BMAD_LOOP_TASK_ID" "$sid" > "$ed/$ts2-$BMAD_LOOP_TASK_ID-Stop.json"
 sleep 60  # stay alive like an idle interactive session
 """
 
@@ -799,7 +807,7 @@ class _ScriptedWatcher:
         return self._events.pop(0) if self._events else None
 
 
-def _stop_event(task_id, session_id, transcript_path):
+def _stop_event(task_id, session_id, transcript_path, lineage=None):
     return HookEvent(
         ts=1,
         event="Stop",
@@ -807,6 +815,7 @@ def _stop_event(task_id, session_id, transcript_path):
         session_id=session_id,
         transcript_path=transcript_path,
         path=Path("x"),
+        lineage=lineage,
     )
 
 
@@ -1579,6 +1588,136 @@ def test_wait_for_completion_ignores_child_end_after_unidentified_session_start(
     ]
 
 
+def _unannounced_child_end_run(tmp_path, monkeypatch, pinned_session_id):
+    """DW-508's stream: the parent starts, a nested child that never announced a
+    SessionStart fires SessionEnd, then the parent's own Stop. The done spec
+    lands with the parent's Stop (call 3), so a session the child's end crashed
+    at call 2 finds no artifact to grade."""
+    monkeypatch.setattr(generic, "RESULT_GRACE_S", 0.0)
+    monkeypatch.setattr(generic, "RESULT_POLL_S", 0.0)
+    adapter, impl = make_dev_adapter(tmp_path)
+    parent_id = pinned_session_id or "outer-session"
+
+    def flush_terminal_spec(call_n):
+        if call_n == 3:
+            (impl / "spec-3-1-foo.md").write_text(
+                "---\nstatus: done\n---\n\n## Auto Run Result\n\nStatus: done\n"
+            )
+
+    adapter.watcher = _ScriptedWatcher(
+        [
+            _hook_event("SessionStart", session_id=parent_id, transcript_path="/outer.jsonl"),
+            _hook_event("SessionEnd", session_id="nested-child", transcript_path="/child.jsonl"),
+            _stop_event("3-1-dev-1", parent_id, "/outer.jsonl"),
+        ],
+        on_call=flush_terminal_spec,
+    )
+    handle = SessionHandle(task_id="3-1-dev-1", native_id="@1", pinned_session_id=pinned_session_id)
+    return adapter, adapter.wait_for_completion(handle, _dev_spec(tmp_path))
+
+
+def test_wait_for_completion_pinned_drops_an_unannounced_child_session_end(tmp_path, monkeypatch):
+    """DW-505/508: with the launch-time id pinned on the handle, a nested child's
+    SessionEnd is foreign even though the child never announced a SessionStart,
+    so it neither crashes the parent nor re-points its identity.
+
+    Ablation guard: delete the pinned-only SessionEnd branch in
+    `SessionAttribution.admit` and this crashes like the unpinned twin below."""
+    pinned = str(uuid.uuid4())
+    adapter, result = _unannounced_child_end_run(tmp_path, monkeypatch, pinned)
+
+    assert result.status == "completed"
+    assert result.session_id == pinned
+    assert result.transcript_path == "/outer.jsonl"
+    ignored = [
+        entry
+        for entry in _lifecycle_lines(adapter)
+        if entry["event"] == "foreign-hook-event-ignored"
+    ]
+    assert [(entry["hook_event"], entry["foreign_session_id"]) for entry in ignored] == [
+        ("SessionEnd", "nested-child")
+    ]
+
+
+class _LaunchingUnitMux(_UnitMux):
+    """`_UnitMux` plus the launch ops `start_session` performs (the session
+    already exists, so no `new_session`); records the window command."""
+
+    def __init__(self):
+        super().__init__()
+        self.command = ""
+
+    def new_window(self, session, name, cwd, env, command):
+        self.command = command
+        return "@1"
+
+    def pipe_pane(self, window_id, log_file):
+        return None
+
+
+def test_pinned_id_from_start_session_drives_wait_for_completion(tmp_path, monkeypatch):
+    """DW-505/508 through ONE handle: the claude profile's `start_session` mints the
+    id, launches it as `--session-id <id>`, and `wait_for_completion` on the
+    RETURNED handle pins attribution to it — so an unannounced child SessionEnd is
+    dropped and crumbed while the parent's Stop completes the session."""
+    monkeypatch.setattr(generic, "RESULT_GRACE_S", 0.0)
+    monkeypatch.setattr(generic, "RESULT_POLL_S", 0.0)
+    mux = _LaunchingUnitMux()
+    adapter, impl = make_dev_adapter(tmp_path, mux=mux)
+    spec = _dev_spec(tmp_path)
+
+    handle = adapter.start_session(spec)
+    pinned = handle.pinned_session_id
+    assert pinned is not None
+    assert shlex.split(mux.command)[-2:] == ["--session-id", pinned]
+
+    def flush_terminal_spec(call_n):
+        if call_n == 3:
+            spec_path = impl / "spec-3-1-foo.md"
+            spec_path.write_text("---\nstatus: done\n---\n\n## Auto Run Result\n\nStatus: done\n")
+            # The handle's launched_ns is real (time.time_ns() at start_session),
+            # and a Windows mtime comes from a coarser clock, so a spec written
+            # just after can read as older than the launch and be skipped as a
+            # stale prior artifact. Stamp it past the launch.
+            later = handle.launched_ns + _MTIME_TICK_NS
+            os.utime(spec_path, ns=(later, later))
+
+    adapter.watcher = _ScriptedWatcher(
+        [
+            _hook_event("SessionStart", session_id=pinned, transcript_path="/outer.jsonl"),
+            _hook_event("SessionEnd", session_id="nested-child", transcript_path="/child.jsonl"),
+            _stop_event(spec.task_id, pinned, "/outer.jsonl"),
+        ],
+        on_call=flush_terminal_spec,
+    )
+    result = adapter.wait_for_completion(handle, spec)
+
+    assert result.status == "completed"
+    assert result.session_id == pinned
+    ignored = [
+        entry
+        for entry in _lifecycle_lines(adapter)
+        if entry["event"] == "foreign-hook-event-ignored"
+    ]
+    assert [(entry["hook_event"], entry["foreign_session_id"]) for entry in ignored] == [
+        ("SessionEnd", "nested-child")
+    ]
+
+
+def test_wait_for_completion_unpinned_admits_an_unannounced_child_session_end(
+    tmp_path, monkeypatch
+):
+    """The same stream without a pin: the accepted limitation stands, so the
+    child's SessionEnd reads as the parent's own and crashes the session. Proves
+    the pin — not some other filter — is what drops it in the test above."""
+    adapter, result = _unannounced_child_end_run(tmp_path, monkeypatch, None)
+
+    assert result.status == "crashed"
+    assert not any(
+        entry["event"] == "foreign-hook-event-ignored" for entry in _lifecycle_lines(adapter)
+    )
+
+
 def test_wait_for_completion_foreign_start_never_repoints_transcript(tmp_path, monkeypatch):
     """Review finding M2: a nested child's SessionStart as the LAST hook event,
     then window death. The dropped start must not re-point the identity or the
@@ -1801,7 +1940,8 @@ def test_wait_for_completion_keeps_matching_parent_session_end_crash(tmp_path):
     assert result.status == "crashed"
     assert result.session_id == outer_id
     assert result.transcript_path == "/outer.jsonl"
-    assert _lifecycle_lines(adapter) == []
+    # An untagged (pre-DW-507) start leaves lineage unavailable: that crumb, no other.
+    assert [entry["event"] for entry in _lifecycle_lines(adapter)] == ["hook-lineage-untrusted"]
 
 
 def test_wait_for_completion_preserves_no_id_hook_compatibility(tmp_path):
@@ -1823,7 +1963,299 @@ def test_wait_for_completion_preserves_no_id_hook_compatibility(tmp_path):
     assert result.status == "completed"
     assert result.session_id is None
     assert result.transcript_path == "/legacy.jsonl"
-    assert _lifecycle_lines(adapter) == []
+    # An untagged (pre-DW-507) start leaves lineage unavailable: that crumb, no other.
+    assert [entry["event"] for entry in _lifecycle_lines(adapter)] == ["hook-lineage-untrusted"]
+
+
+def test_trusted_lineage_drops_a_nested_childs_clear_rotation_and_stop(tmp_path):
+    """DW-507: once the launched session's first SessionStart is tagged
+    `lineage: "match"`, a `mismatch`-tagged event is foreign. The case the #767
+    rules alone cannot catch: a nested child rotating its id with a `clear`
+    start and no preceding SessionEnd would rebind, and its Stop would then
+    complete the session under the child's identity. Here both are dropped and
+    the parent's own Stop completes it.
+
+    Ablation: delete the trusted-mismatch check at the top of
+    `SessionAttribution.admit` and this fails — the session completes on the
+    child's Stop with the child's id and transcript."""
+    adapter, impl = make_dev_adapter(tmp_path)
+    (impl / "spec-3-1-foo.md").write_text(
+        "---\nstatus: done\n---\n\n## Auto Run Result\n\nStatus: done\n"
+    )
+    adapter.watcher = _ScriptedWatcher(
+        [
+            _hook_event(
+                "SessionStart", session_id="outer", transcript_path="/outer.jsonl", lineage="match"
+            ),
+            _hook_event(
+                "SessionStart",
+                session_id="child-new",
+                transcript_path="/child.jsonl",
+                source="clear",
+                lineage="mismatch",
+            ),
+            _stop_event("3-1-dev-1", "child-new", "/child.jsonl", lineage="mismatch"),
+            _stop_event("3-1-dev-1", "outer", "/outer.jsonl", lineage="match"),
+        ]
+    )
+
+    result = adapter.wait_for_completion(_dev_handle(), _dev_spec(tmp_path))
+
+    assert result.status == "completed"
+    assert result.session_id == "outer"
+    assert result.transcript_path == "/outer.jsonl"
+    lines = _lifecycle_lines(adapter)
+    assert [entry["event"] for entry in lines] == ["foreign-hook-event-ignored"]
+    assert lines[0] == {
+        "ts": lines[0]["ts"],
+        "event": "foreign-hook-event-ignored",
+        "hook_event": "SessionStart",
+        "foreign_session_id": "child-new",
+        "dropped_so_far": 1,
+    }
+
+
+def test_trusted_lineage_drops_id_less_mismatch_stops_and_crumbs_them_once(tmp_path):
+    """DW-507: id-less events used to always pass attribution. Under a trusted
+    lineage an id-less `mismatch` Stop is a nested child's and is dropped; the
+    drops share one crumb (`foreign_session_id: null`, the #767 shape), an
+    empty-string id included.
+
+    Ablation: key the dedup on the raw `session_id` and a second crumb with
+    `foreign_session_id: ""` appears; delete the trusted-mismatch check in `SessionAttribution.admit`
+    and this fails — the first id-less Stop completes the session with the
+    child's transcript."""
+    adapter, impl = make_dev_adapter(tmp_path)
+    (impl / "spec-3-1-foo.md").write_text(
+        "---\nstatus: done\n---\n\n## Auto Run Result\n\nStatus: done\n"
+    )
+    adapter.watcher = _ScriptedWatcher(
+        [
+            _hook_event(
+                "SessionStart", session_id="outer", transcript_path="/outer.jsonl", lineage="match"
+            ),
+            _stop_event("3-1-dev-1", None, "/child.jsonl", lineage="mismatch"),
+            # An empty-string id is id-less too: it shares the None-keyed crumb.
+            _stop_event("3-1-dev-1", "", "/child.jsonl", lineage="mismatch"),
+            _stop_event("3-1-dev-1", "outer", "/outer.jsonl", lineage="match"),
+        ]
+    )
+
+    result = adapter.wait_for_completion(_dev_handle(), _dev_spec(tmp_path))
+
+    assert result.status == "completed"
+    assert result.session_id == "outer"
+    assert result.transcript_path == "/outer.jsonl"
+    (crumb,) = _lifecycle_lines(adapter)
+    assert crumb == {
+        "ts": crumb["ts"],
+        "event": "foreign-hook-event-ignored",
+        "hook_event": "Stop",
+        "foreign_session_id": None,
+        "dropped_so_far": 1,
+    }
+
+
+def test_trusted_lineage_mismatch_stop_is_counted_not_completed(tmp_path, monkeypatch):
+    """DW-507 acceptance: a nested child's `mismatch` Stop after a `match` first
+    start never completes the session, and it is counted in
+    `foreign_hook_events` where an operator looks (timeout-fired, heartbeat)."""
+    adapter, clock = _timeout_clock_adapter(tmp_path, monkeypatch)
+    adapter._stall_grace_s = 0.0
+
+    def advance(call_n):
+        if call_n > 2:
+            clock["mono"] += 1000.0
+
+    adapter.watcher = _ScriptedWatcher(
+        [
+            _hook_event("SessionStart", session_id="parent", lineage="match"),
+            _stop_event("3-1-dev-1", "child", None, lineage="mismatch"),
+        ],
+        on_call=advance,
+    )
+    result = adapter.wait_for_completion(_dev_handle(), _short_spec(tmp_path, timeout_s=100.0))
+
+    assert result.status == "timeout"
+    assert result.stop_seen is False
+    (fired,) = _lifecycle_events(adapter, "timeout-fired")
+    assert fired["foreign_hook_events"] == 1
+
+
+def _pinned_timeout_run(tmp_path, monkeypatch, make_events):
+    """Drive a pinned handle through `make_events(pinned_id)` to its timeout:
+    nothing in these streams completes the session, so once the script runs dry
+    the clock crosses the deadline and ends the wait."""
+    adapter, clock = _timeout_clock_adapter(tmp_path, monkeypatch)
+    adapter._stall_grace_s = 0.0
+    pinned = str(uuid.uuid4())
+    events = make_events(pinned)
+    n_events = len(events)
+
+    def advance(call_n):
+        if call_n > n_events:
+            clock["mono"] += 1000.0
+
+    adapter.watcher = _ScriptedWatcher(events, on_call=advance)
+    handle = SessionHandle(task_id="3-1-dev-1", native_id="@1", pinned_session_id=pinned)
+    result = adapter.wait_for_completion(handle, _short_spec(tmp_path, timeout_s=100.0))
+    assert result.status == "timeout"
+    return adapter, result, pinned
+
+
+def test_pinned_session_id_mismatch_is_crumbed_once(tmp_path, monkeypatch):
+    """DW-509: a CLI that reports an id other than the launch-time pin on its
+    first non-rebind SessionStart (here an overlay's `--resume`) is foreign to
+    attribution, so its own Stop is dropped and only the timeout ends it. The
+    divergence is visible as ONE `pinned-session-id-mismatch` crumb; a later
+    child's `startup` start does not crumb again.
+
+    Ablation: delete the crumb in `wait_for_completion` and this fails; drop the
+    `pin_checked` latch and the child's start crumbs a second time."""
+    adapter, result, pinned = _pinned_timeout_run(
+        tmp_path,
+        monkeypatch,
+        lambda pinned: [
+            _hook_event("SessionStart", session_id="resumed-id", source="resume"),
+            _stop_event("3-1-dev-1", "resumed-id", None),
+            _hook_event("SessionStart", session_id="child-id", source="startup"),
+        ],
+    )
+
+    assert result.stop_seen is False
+    (crumb,) = _lifecycle_events(adapter, "pinned-session-id-mismatch")
+    assert crumb == {
+        "ts": crumb["ts"],
+        "event": "pinned-session-id-mismatch",
+        "pinned_session_id": pinned,
+        "reported_session_id": "resumed-id",
+        "source": "resume",
+    }
+
+
+def test_pinned_session_id_match_settles_the_check(tmp_path, monkeypatch):
+    """DW-509 negative: a first start carrying the pin settles the check, so a
+    nested child's `startup` start after it is attribution's business (dropped
+    and crumbed as foreign), not a pin mismatch.
+
+    Ablation: drop the `pin_checked` latch and the child's start crumbs."""
+    adapter, _, _ = _pinned_timeout_run(
+        tmp_path,
+        monkeypatch,
+        lambda pinned: [
+            _hook_event("SessionStart", session_id=pinned, source="startup"),
+            _hook_event("SessionStart", session_id="child-id", source="startup"),
+        ],
+    )
+
+    assert _lifecycle_events(adapter, "pinned-session-id-mismatch") == []
+    ignored = _lifecycle_events(adapter, "foreign-hook-event-ignored")
+    assert [(entry["hook_event"], entry["foreign_session_id"]) for entry in ignored] == [
+        ("SessionStart", "child-id")
+    ]
+
+
+@pytest.mark.parametrize(
+    ("parent_id", "expected"),
+    [(None, []), ("resumed-id", [("resumed-id", "resume")])],
+    ids=["parent-honours-pin", "parent-ignores-pin"],
+)
+def test_pinned_session_id_check_defers_a_nested_mismatch_start(
+    tmp_path, monkeypatch, parent_id, expected
+):
+    """DW-509: a nested CLI's start (one launched by a parallel SessionStart
+    hook) can reach the events dir before the launched session's own. Rejected
+    by the pin and tagged `mismatch` by the relay, it is not the CLI's answer to
+    `--session-id`, so the check waits for the next start: a parent carrying
+    the pin crumbs nothing, and a parent reporting another id is the one named.
+
+    Ablation: drop the `admitted or lineage != "mismatch"` guard and the child's
+    start crumbs in both cases (and latches the check before the parent's)."""
+    adapter, _, _ = _pinned_timeout_run(
+        tmp_path,
+        monkeypatch,
+        lambda pinned: [
+            _hook_event(
+                "SessionStart", session_id="child-id", source="startup", lineage="mismatch"
+            ),
+            _hook_event(
+                "SessionStart",
+                session_id=parent_id or pinned,
+                source="resume" if parent_id else "startup",
+                lineage="match",
+            ),
+        ],
+    )
+
+    crumbs = _lifecycle_events(adapter, "pinned-session-id-mismatch")
+    assert [(c["reported_session_id"], c["source"]) for c in crumbs] == expected
+
+
+def test_pinned_session_id_check_skips_anonymous_and_rebind_starts(tmp_path, monkeypatch):
+    """DW-509 negative: an anonymous start (unreadable payload) carries no id to
+    compare, and a `compact` rotation is the launched session changing its own
+    id, so neither is a pin mismatch.
+
+    Ablation: drop the `source not in REBIND_SOURCES` guard and the rotation
+    crumbs."""
+    adapter, _, _ = _pinned_timeout_run(
+        tmp_path,
+        monkeypatch,
+        lambda pinned: [
+            _hook_event("SessionStart", session_id=None),
+            _hook_event("SessionStart", session_id="rotated-id", source="compact"),
+        ],
+    )
+
+    assert _lifecycle_events(adapter, "pinned-session-id-mismatch") == []
+
+
+@pytest.mark.parametrize(
+    ("first_tag", "reason"),
+    [("mismatch", "miscalibrated"), ("unknown", "unavailable"), (None, "unavailable")],
+)
+def test_untrusted_lineage_crumbs_once_and_keeps_the_767_rules(tmp_path, first_tag, reason):
+    """DW-507: a first SessionStart not tagged `match` leaves lineage untrusted
+    for the attempt — a `mismatch` Stop is admitted exactly as before — and the
+    degrade is visible as ONE `hook-lineage-untrusted` crumb carrying the reason
+    and the first start's tag, however many starts follow.
+
+    Ablation: delete the crumb in `wait_for_completion` and this fails; drop the
+    `lineage_crumbed` latch and the second start crumbs again."""
+    adapter, impl = make_dev_adapter(tmp_path)
+    (impl / "spec-3-1-foo.md").write_text(
+        "---\nstatus: done\n---\n\n## Auto Run Result\n\nStatus: done\n"
+    )
+    adapter.watcher = _ScriptedWatcher(
+        [
+            _hook_event(
+                "SessionStart",
+                session_id="outer",
+                transcript_path="/outer.jsonl",
+                lineage=first_tag,
+            ),
+            _hook_event(
+                "SessionStart",
+                session_id="outer",
+                transcript_path="/outer.jsonl",
+                source="compact",
+                lineage=first_tag,
+            ),
+            _stop_event("3-1-dev-1", "outer", "/outer.jsonl", lineage="mismatch"),
+        ]
+    )
+
+    result = adapter.wait_for_completion(_dev_handle(), _dev_spec(tmp_path))
+
+    assert result.status == "completed"
+    assert result.session_id == "outer"
+    (crumb,) = _lifecycle_lines(adapter)
+    assert crumb == {
+        "ts": crumb["ts"],
+        "event": "hook-lineage-untrusted",
+        "reason": reason,
+        "lineage": first_tag,
+    }
 
 
 def test_wait_for_completion_transcriptless_stop_is_terminal_without_flag(tmp_path):
@@ -4999,6 +5431,18 @@ def _write_fake_cli(tmp_path, script: str = FAKE_CLI):
     return fake
 
 
+def _assert_fake_session_id(adapter, result, fallback="fake-1"):
+    """The session id FAKE_CLI reported: under a profile declaring
+    ``session_id_flag`` (claude) it is the UUID4 the adapter minted and pinned
+    attribution to (DW-505) — the fake echoes it into result.json as ``fake_sid``
+    — and ``fallback`` otherwise."""
+    if adapter.profile.session_id_flag:
+        assert result.session_id == result.result_json["fake_sid"]
+        assert uuid.UUID(result.session_id).version == 4
+    else:
+        assert result.session_id == fallback
+
+
 @pytest.mark.skipif(not HAVE_TMUX, reason="tmux not available")
 @real_mux_e2e
 @pytest.mark.parametrize("profile_name", ["claude", "codex", "gemini"])
@@ -5032,7 +5476,7 @@ def test_tmux_end_to_end_with_fake_cli(tmp_path, profile_name):
     assert result.result_json["workflow"] == "auto-dev"
     # the fake echoes back the rendered prompt it received
     assert result.result_json["prompt"] == adapter.profile.render_prompt(spec.prompt)
-    assert result.session_id == "fake-1"
+    _assert_fake_session_id(adapter, result)
     # canonical prompt recorded for debugging
     assert (adapter.tasks_dir / "t-int-1" / "prompt.txt").read_text().strip() == spec.prompt
 
@@ -5075,7 +5519,7 @@ def test_tmux_reused_task_id_ignores_stale_artifacts(tmp_path):
 
     assert result.status == "completed"
     assert result.result_json["workflow"] == "auto-dev"  # fresh, not "STALE"
-    assert result.session_id == "fake-1"  # fresh session, not "old"
+    _assert_fake_session_id(adapter, result)  # fresh session, not "old"
 
 
 @pytest.mark.skipif(not HAVE_TMUX, reason="tmux not available")
@@ -5115,7 +5559,7 @@ def test_tmux_end_to_end_with_a_relay_that_only_knows_the_legacy_dir(tmp_path):
         subprocess.run(["tmux", "kill-session", "-t", adapter.session_name], capture_output=True)
 
     assert result.status == "completed"
-    assert result.session_id == "fake-1"
+    _assert_fake_session_id(adapter, result)
     # the premise, asserted rather than assumed: the events really did land in the
     # legacy location and nowhere else, so the completion came through the fallback
     assert list((adapter.run_dir / "events").glob("*.json"))
@@ -9079,6 +9523,7 @@ def _hook_event(
     session_id="sess",
     transcript_path=None,
     source=None,
+    lineage=None,
 ):
     return HookEvent(
         ts=1,
@@ -9089,6 +9534,7 @@ def _hook_event(
         path=Path("x"),
         notification_type=notification_type,
         source=source,
+        lineage=lineage,
     )
 
 
@@ -9306,6 +9752,86 @@ def test_pane_matched_prompt_withholds_the_stall_nudge(tmp_path, monkeypatch, li
     assert result.parked_evidence.endswith(line)
     assert mux.sent == []
     assert mux.captures == ["@1"]
+
+
+# DW-339's operator capture: raw `tmux pipe-pane` bytes of a claude trust prompt
+# left parked for 80 s (Claude Code 2.1.284; provenance in the sibling .md).
+TRUST_PROMPT_LOG = Path(__file__).parent / "fixtures" / "claude-trust-prompt-parked.pipe-pane.log"
+_CHA = regex.compile(rb"\x1b\[(\d*)G")
+_NON_CHA_ESCAPE = regex.compile(
+    rb"\x1b(?:\[[0-?]*[ -/]*[@-~]|\][^\x07\x1b]*(?:\x07|\x1b\\)|P.*?\x1b\\|[0-~])", regex.S
+)
+
+
+def _render_pane(raw: bytes) -> str:
+    """The visible text `capture-pane -p` shows for the DW-339 capture: each CHA
+    (`ESC[<n>G`) pads the line out to its column, and every other escape is
+    dropped. The capture separates words with CHA, so a raw-byte match cannot
+    find the footer. Its only other cursor moves (`ESC[1C`, `ESC[4A`) come after
+    the footer and are followed by nothing but terminal queries, so dropping
+    them loses no text. A capture that moves the cursor and then prints needs a
+    real terminal model. CRs are dropped, so a Windows `autocrlf` checkout
+    renders the same."""
+    rows = []
+    for line in raw.replace(b"\r", b"").split(b"\n"):
+        row = ""
+        pos = 0
+        for m in _CHA.finditer(line):
+            row += _NON_CHA_ESCAPE.sub(b"", line[pos : m.start()]).decode()
+            row = row.ljust(int(m.group(1) or b"1") - 1)
+            pos = m.end()
+        row += _NON_CHA_ESCAPE.sub(b"", line[pos:]).decode()
+        rows.append(row.rstrip())
+    return "\n".join(rows)
+
+
+def test_parked_trust_prompt_capture_is_parked_and_no_work(tmp_path, monkeypatch):
+    """DW-339, replayed from the committed capture: the trust prompt paints once
+    within 5 s and the log stays byte-static for the 80 s the operator watched.
+    The operator's 5 s size samples (see the sibling .md) show no timer repaint,
+    and the trailing terminal queries were never re-sent. So no tick after
+    FIRST_FRAME_S sees the pane change, and `activity_seen` stays False. At grace expiry the shipped claude footer pattern (the #727 footer,
+    identical on this dialog) matches the rendered screen: the due nudge is
+    withheld and the session ends `stalled` + `parked` with `produced_work` False,
+    so it pauses instead of retrying.
+
+    ABLATION: drop the `> FIRST_FRAME_S` guard in `sample_frame` and the one paint
+    counts as work (True)."""
+    raw = TRUST_PROMPT_LOG.read_bytes()
+    screen = _render_pane(raw)
+    assert "Quick safety check: Is this a project you created or one you trust?" in screen
+    assert BYPASS_FOOTER in [row.strip() for row in screen.splitlines()]  # rendered only
+    assert BYPASS_FOOTER.encode() not in raw
+    assert BYPASS_HEADING not in screen  # the footer alone labels this dialog
+
+    monkeypatch.setattr(generic, "RESULT_GRACE_S", 0.0)
+    mux = _UnitMux(screen=screen)
+    adapter, _ = make_dev_adapter(tmp_path, mux=mux)
+    adapter._stall_grace_s = 70.0  # the static stretch outlasts the 60 s bar
+    adapter._stall_nudges = 1  # a nudge is due at expiry: the gate must withhold it
+    adapter._window_alive = lambda handle: True
+    log = _pane_log(adapter, "3-1-dev-1", 0)  # 0 B at launch, as captured
+    clock = _steerable_clock(monkeypatch)
+    launched = clock["t"]
+
+    def script(call_n):
+        if call_n == 1:
+            clock["t"] += 1.0  # the whole capture lands inside the startup window
+            _grow(log, raw)
+        else:
+            clock["t"] += 5.0  # the operator's 5 s samples: no byte ever added
+
+    adapter.watcher = _ScriptedWatcher([], on_call=script)
+    spec = dataclasses.replace(_dev_spec(tmp_path), timeout_s=1000.0)
+    result = adapter.wait_for_completion(_dev_handle(), spec)
+
+    assert clock["t"] - launched > 60.0  # parked past the capture's bar before expiry
+    assert (result.status, result.parked) == ("stalled", True)
+    assert result.parked_evidence is not None
+    assert result.parked_evidence.endswith(BYPASS_FOOTER)
+    assert mux.sent == []
+    assert result.stop_seen is False
+    assert result.produced_work is False
 
 
 def test_clean_pane_nudges_exactly_as_today(tmp_path, monkeypatch):

@@ -7,6 +7,21 @@ breaking changes may land in a minor release.
 
 ## [Unreleased]
 
+### Added
+
+- Tag hook events with relay-side process lineage; once the launched session's first
+  `SessionStart` reads `match`, a nested CLI's `mismatch` events (id-less included) are
+  dropped. Untrusted lineage writes one `hook-lineage-untrusted` crumb (DW-507).
+- Write one `pinned-session-id-mismatch` crumb when a pinned session's first non-rebind
+  `SessionStart` reports an id other than the pin, so the drop of its own events as
+  foreign is no longer silent; a nested CLI's `mismatch`-tagged start is skipped (DW-509).
+
+### Changed
+
+- A tmux coding-CLI pane's start command now shows the `/bin/sh -c
+'BMAD_LOOP_LAUNCH_PID=$$; …'` prelude; the command itself runs under `default-shell`
+  exactly as before (DW-507).
+
 ### Fixed
 
 - Ignore hook events from nested coding-CLI sessions that inherit the relay environment,
@@ -17,6 +32,15 @@ breaking changes may land in a minor release.
   `timeout-fired`, and excluded from the sweep diagnostic (`hook_foreign_ids`). Forward
   SessionStart `source` so a `clear`/`compact` start rebinds; re-run `bmad-loop init` to
   re-vendor the relay (#767). Contributed by [@Pinstack](https://github.com/Pinstack).
+- Pin the launched session's id at launch for hook-event attribution: a new profile key
+  `session_id_flag` (claude: `--session-id`) makes the generic adapter pass a minted UUID4
+  and treat an identified `SessionStart`/`SessionEnd` from any id the session never had
+  as foreign (a `clear`/`compact` rebind still counts as its own), so a nested child's
+  `SessionEnd` without a prior `SessionStart` no longer crashes the parent (DW-505/508).
+  A same-name `.bmad-loop/profiles/claude.toml` overlay replaces the packaged profile and
+  stays unpinned until it adds `session_id_flag = "--session-id"`. A claude run paused
+  before upgrading reports the host-exec config changed on resume: its launched argv
+  gained `--session-id`. Dry-run previews show the flag as `--session-id <auto>`.
 
 ## [0.13.0] — 2026-09-28
 

@@ -243,6 +243,15 @@ class CLIProfile:
     # APPENDED with a default so every positional CLIProfile construction stays
     # valid.
     workspace_trust: WorkspaceTrustSpec | None = None
+    # The CLI's launch flag for a caller-chosen session id (DW-505), e.g. claude's
+    # "--session-id". When set, the generic adapter mints a UUID4 per launch,
+    # appends `[session_id_flag, uuid]` to the launched argv and pins hook-event
+    # attribution to it (signals.SessionAttribution), so a nested child's
+    # SessionEnd is foreign even when the child never announced a SessionStart
+    # (DW-508). "" = off: attribution learns the id from the first SessionStart.
+    # An argv flag, so it is part of runsetup.config_digest's launch surface.
+    # APPENDED after workspace_trust for the same positional-compatibility reason.
+    session_id_flag: str = ""
 
     @property
     def hookless(self) -> bool:
@@ -414,6 +423,32 @@ def _validate_profile(profile: CLIProfile, source: str) -> None:
             "drives this CLI over its own transport."
         )
 
+    # "" = off. Otherwise ONE option token: the adapter appends it and the minted
+    # id as two argv elements, so whitespace (which could never be one flag) or a
+    # non-option word (which a CLI reads as a positional — the prompt slot) is a
+    # profile error, not a launch surprise. A hookless profile has no hook events
+    # to attribute, so a pin there is a contradiction.
+    flag = profile.session_id_flag
+    if flag:
+        # No `=`: the id is passed as the NEXT argv element, so `--session-id=`
+        # would launch as the two tokens `--session-id=` `<uuid>`.
+        if (
+            not flag.startswith("-")
+            or flag.strip("-") == ""
+            or "=" in flag
+            or any(c.isspace() for c in flag)
+        ):
+            raise fail(
+                "session_id_flag must be one option token starting with '-', with no "
+                "whitespace and no '=' (the id is passed as the next argument, e.g. "
+                f'"--session-id"), or "" for none: got {flag!r}'
+            )
+        if profile.hookless:
+            raise fail(
+                'hookless profiles (dialect = "none") must not set session_id_flag: '
+                "it pins hook-event attribution, and a hookless profile has no hook events"
+            )
+
     if profile.usage_parser not in USAGE_PARSERS:
         raise fail(
             f"usage_parser must be one of {sorted(USAGE_PARSERS)}: got {profile.usage_parser!r}"
@@ -580,6 +615,12 @@ def _parse_profile(doc: dict, source: str) -> CLIProfile:
     if not isinstance(raw_adapter, str):
         raise fail(f"adapter must be a string: got {type(raw_adapter).__name__}")
 
+    # Same rule as `adapter`: an argv token, so a TOML array or number must not be
+    # `str()`-coerced into a flag the CLI is then launched with.
+    raw_session_id_flag = doc.get("session_id_flag", "")
+    if not isinstance(raw_session_id_flag, str):
+        raise fail(f"session_id_flag must be a string: got {type(raw_session_id_flag).__name__}")
+
     profile = CLIProfile(
         name=str(doc.get("name", "")).strip(),
         binary=str(doc.get("binary", "")).strip(),
@@ -595,6 +636,7 @@ def _parse_profile(doc: dict, source: str) -> CLIProfile:
         launch_args=str_list("launch_args"),
         bypass_args=str_list("bypass_args"),
         model_flag=str(doc.get("model_flag", "--model")),
+        session_id_flag=raw_session_id_flag,
         env={str(k): str(v) for k, v in doc.get("env", {}).items()},
         usage_parser=str(doc.get("usage_parser", "none")),
         # `float()`/`int()` are the raw coercions `_load_toml`'s CONVERSION_FAULTS

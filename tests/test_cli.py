@@ -144,8 +144,12 @@ def test_dry_run_renders_per_stage_commands(project, capsys):
     dev_line = next(line for line in out.splitlines() if "dev:" in line)
     review_line = next(line for line in out.splitlines() if "review:" in line)
     assert "claude" in dev_line and "--model opus" in dev_line
+    # DW-505: claude's launch appends the pinned id after the model flag; codex
+    # declares no session_id_flag, so its preview carries none.
+    assert dev_line.endswith("--model opus --session-id <auto>")
     assert review_line.split("review:")[1].strip().startswith("codex ")
     assert "--model gpt-5-codex" in review_line
+    assert "--session-id" not in review_line
 
 
 def _shim_only(paths) -> None:
@@ -10561,7 +10565,9 @@ def test_dry_run_warns_on_stderr_when_extra_args_drops_the_bypass(project, capsy
     assert _bypass_err_lines(baseline.err) == []
     assert warned.out == baseline.out
     dev_line = next(ln for ln in warned.out.splitlines() if "dev:" in ln)
-    assert dev_line.endswith("--verbose") and "bypassPermissions" not in dev_line
+    assert (
+        dev_line.endswith("--verbose --session-id <auto>") and "bypassPermissions" not in dev_line
+    )
 
 
 def test_dry_run_warns_for_the_retro_role_under_auto_retrospective(project, capsys):
@@ -10591,7 +10597,7 @@ def test_dry_run_silent_when_extra_args_keeps_the_bypass(project, capsys):
     result = _sprint_dry_run(project, capsys, policy)
     assert _bypass_err_lines(result.err) == []
     dev_line = next(ln for ln in result.out.splitlines() if "dev:" in ln)
-    assert dev_line.endswith("--permission-mode bypassPermissions --verbose")
+    assert dev_line.endswith("--permission-mode bypassPermissions --verbose --session-id <auto>")
 
 
 def test_dry_run_silent_on_the_opencode_kind(project, capsys):

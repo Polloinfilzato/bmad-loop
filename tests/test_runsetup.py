@@ -151,6 +151,13 @@ def test_digest_preserves_verify_command_order(pinned):
             'prompt_template = "--mcp-config=/tmp/evil.json"\nbinary = "mycli"',
             id="prompt_template",
         ),
+        # session_id_flag is an argv FLAG `build_command` appends to the launched
+        # command (DW-505): an overlay that adds one adds a launched option.
+        pytest.param(
+            'binary = "mycli"',
+            'session_id_flag = "--exec"\nbinary = "mycli"',
+            id="session_id_flag",
+        ),
     ],
 )
 def test_digest_moves_on_any_resolved_profile_launch_field(pinned, old, new):
@@ -161,6 +168,59 @@ def test_digest_moves_on_any_resolved_profile_launch_field(pinned, old, new):
     before = _digest(pinned)
     _rewrite_profile(pinned, old, new)
     assert _digest(pinned) != before
+
+
+def test_digest_moves_on_a_rewritten_session_id_flag(pinned):
+    """Rewriting an existing `session_id_flag` swaps which option the minted id is
+    handed to, so it moves the digest too — not only adding one."""
+    with_flag = PROFILE.replace(
+        'binary = "mycli"', 'session_id_flag = "--session-id"\nbinary = "mycli"'
+    )
+    (pinned / PROFILE_REL).write_text(with_flag, encoding="utf-8")
+    before = _digest(pinned)
+    (pinned / PROFILE_REL).write_text(
+        with_flag.replace('"--session-id"', '"--resume"'), encoding="utf-8"
+    )
+    assert _digest(pinned) != before
+
+
+def _pre_session_id_flag_digest(project, policy_text=POLICY) -> str:
+    """The digest payload exactly as it was shaped before `session_id_flag`
+    existed, rebuilt by hand — the value a run paused on the previous release
+    stamped."""
+    policy = policy_mod.loads(policy_text)
+    profiles = runsetup.resolve_profiles(policy, project)
+    launch = {}
+    for role in runsetup.ROLES:
+        cfg = policy.adapter.resolved(role)
+        prof = profiles[role]
+        launch[role] = {
+            "binary": prof.binary,
+            "launch_args": list(prof.launch_args),
+            "bypass_args": list(prof.bypass_args),
+            "model_flag": prof.model_flag,
+            "prompt_template": prof.prompt_template,
+            "env": dict(prof.env),
+            "adapter": prof.adapter,
+            "hookless": prof.hookless,
+            "extra_args": None if cfg.extra_args is None else list(cfg.extra_args),
+        }
+    payload = {
+        "verify_commands": list(policy.verify.commands),
+        "plugins_enabled": sorted(policy.plugins.enabled),
+        "profiles": launch,
+    }
+    return hashlib.sha256(json.dumps(payload, sort_keys=True).encode("utf-8")).hexdigest()
+
+
+@pytest.mark.parametrize("line", ["", 'session_id_flag = ""\n'], ids=["absent", "empty"])
+def test_an_unset_session_id_flag_keeps_the_pre_change_digest(pinned, line):
+    """An unset flag adds no argv token, so it must not move the digest: a run
+    paused on the previous release (codex/gemini, or any profile without the key)
+    and resumed after the upgrade would otherwise report a host-exec config change
+    its launched argv never had. The key joins the payload only when set."""
+    (pinned / PROFILE_REL).write_text(line + PROFILE, encoding="utf-8")
+    assert _digest(pinned) == _pre_session_id_flag_digest(pinned)
 
 
 def test_digest_moves_on_rewritten_adapter_extra_args(pinned):

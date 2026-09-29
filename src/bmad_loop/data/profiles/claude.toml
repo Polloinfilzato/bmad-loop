@@ -4,6 +4,11 @@ binary = "claude"
 prompt_template = "{prompt}"
 bypass_args = ["--permission-mode", "bypassPermissions"]
 model_flag = "--model"
+# Caller-chosen session id (DW-505): the adapter mints a UUID4 per launch and pins
+# hook-event attribution to it, so a nested child's SessionEnd is foreign even
+# without a SessionStart (DW-508). Probed on Claude Code 2.1.284 (zero-token tmux
+# probe, 2026-09-28): SessionStart's session_id equals the --session-id value.
+session_id_flag = "--session-id"
 usage_parser = "claude-jsonl"
 first_run_note = "run `claude` once in the project to accept workspace trust and hooks approval"
 skill_tree = ".claude/skills"
@@ -72,9 +77,12 @@ env_fault_patterns = [
 # Same evidentiary bar as env_fault_patterns above: seed only lines captured from
 # the CLI's own screen. Both entries are from #727's captured pane (Claude Code
 # 2.1.246, run 20260826-114252-3da1) — the dialog's heading and its footer. The
-# single-character classes (`mod[e]`, `t[o]`) keep each pattern from matching its
-# own line here, so a session that prints or diffs this profile does not read as
-# parked; pinned by the parked-pattern tests in tests/test_profile.py.
+# footer is also the workspace trust prompt's, captured parked for 80 s (Claude
+# Code 2.1.284, DW-339: tests/fixtures/claude-trust-prompt-parked.pipe-pane.log),
+# so that one entry labels both dialogs. The single-character classes (`mod[e]`,
+# `t[o]`) keep each pattern from matching its own line here, so a session that
+# prints or diffs this profile does not read as parked; pinned by the
+# parked-pattern tests in tests/test_profile.py.
 parked_prompt_patterns = [
   "WARNING: Claude Code running in Bypass Permissions mod[e]",
   "Enter to confirm · Esc t[o] cancel",

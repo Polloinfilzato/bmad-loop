@@ -17,7 +17,10 @@ override is left for timeout tweaks) plus the shell-dialect hooks (``_shell_wrap
 :meth:`~BaseTmuxBackend.new_parked_window` the hooks replace method-body
 overrides entirely; :meth:`~BaseTmuxBackend.pipe_pane` still hands the
 multiplexer a POSIX ``cat >>`` redirection, so a non-POSIX leaf overrides it
-directly, alongside whatever divergences its multiplexer forces on it.
+directly, alongside whatever divergences its multiplexer forces on it. The
+POSIX launch-pid prelude (DW-507, :data:`LAUNCH_PRELUDE`) is added by the POSIX
+leaf's ``_window_launch``, not this base's, so a leaf that swaps ``_shell_wrap``
+for another dialect never inherits POSIX source.
 
 Every method that talks to tmux funnels through :meth:`BaseTmuxBackend._run`, the
 one place a subprocess is spawned. See :mod:`.multiplexer` for the contract.
@@ -42,6 +45,16 @@ TMUX_TIMEOUT_S = 30
 # targets (bare %N on tmux, =session:%N on psmux — see
 # TerminalMultiplexer.current_return_target), so this never collides with one.
 PARKED_RETURN_DETACH = "detach"
+#: Names the launched CLI's pid inside a coding-CLI window (DW-507). The relays
+#: walk their own parent chain against it to tag each hook event's lineage, so a
+#: nested CLI's hooks can be told from the launched one's. A session-protocol
+#: variable read only by the stdlib relays, so it is not in ``envvars``.
+LAUNCH_PID_ENV = "BMAD_LOOP_LAUNCH_PID"
+#: The POSIX ``sh -c`` source that records the launched pid and then runs the
+#: window's command (``$1``) under the pane's ``$SHELL`` — tmux's
+#: ``default-shell`` — exactly as a bare ``new-window <command>`` would
+#: (DW-507; see ``TmuxMultiplexer._window_launch``).
+LAUNCH_PRELUDE = f'{LAUNCH_PID_ENV}=$$; export {LAUNCH_PID_ENV}; exec "${{SHELL:-/bin/sh}}" -c "$1"'
 
 
 class TmuxError(MultiplexerError):
@@ -442,7 +455,11 @@ class BaseTmuxBackend(TerminalMultiplexer):
 
         Part of the dialect seam because the env-injection *strategy* is
         dialect-coupled: bare ``-e`` flags plus the raw command here, an
-        in-source prelude for a leaf whose shell wraps the command.
+        in-source prelude for a leaf whose shell wraps the command. The POSIX
+        leaf (:class:`~.tmux_backend.TmuxMultiplexer`) adds its launch-pid
+        prelude on top; this base stays dialect-neutral, so a leaf that
+        overrides only :meth:`_shell_wrap` still gets a command its multiplexer
+        runs under its own ``default-shell``.
         """
         env_args: list[str] = []
         for key, value in env.items():

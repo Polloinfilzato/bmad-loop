@@ -2628,6 +2628,10 @@ def _render_invocation(pol, project: Path, role: str, prompt: str) -> str:
     ]
     if cfg.model:
         argv += [profile.model_flag, cfg.model]
+    # The launch mints a fresh UUID4 per session (DW-505) and appends it last,
+    # as `build_command` does; a preview has none, so it shows the placeholder.
+    if profile.session_id_flag:
+        argv += [profile.session_id_flag, "<auto>"]
     return " ".join(argv)
 
 

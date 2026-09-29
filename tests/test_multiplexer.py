@@ -33,6 +33,7 @@ class StubMux(TerminalMultiplexer):
     def __init__(self):
         self.calls: list[str] = []
         self.window_env: dict[str, str] = {}
+        self.window_command = ""
         self._sessions: set[str] = set()
         self._windows: dict[str, list[str]] = {}
         self._next = 0
@@ -53,6 +54,7 @@ class StubMux(TerminalMultiplexer):
     def new_window(self, session, name, cwd, env, command):
         self.calls.append("new_window")
         self.window_env = env
+        self.window_command = command
         self._next += 1
         win = f"@stub{self._next}"
         self._windows.setdefault(session, []).append(win)
@@ -245,6 +247,64 @@ def test_generic_adapter_window_env_pins_the_state_root_over_profile(
     assert envvars.STATE_DIR not in adapter.interactive_env(spec)
     # ...and the rest of the profile/spec env is untouched
     assert stub.window_env["BMAD_LOOP_TASK_ID"] == spec.task_id
+
+
+def _launched(tmp_path, profile):
+    stub = StubMux()
+    adapter = GenericAdapter(
+        run_dir=tmp_path / "run",
+        policy=Policy(limits=LimitsPolicy()),
+        profile=profile,
+        mux=stub,
+        events_dir=tmp_path / "state" / "events",
+    )
+    spec = _spec(tmp_path)
+    handle = adapter.start_session(spec)
+    return adapter, spec, handle, shlex.split(stub.window_command)
+
+
+def test_generic_adapter_launches_claude_with_a_pinned_session_id(tmp_path, no_tmux):
+    """DW-505: the claude profile declares `session_id_flag`, so each launch mints
+    a UUID4, appends `--session-id <uuid>` at the END of the window command, and
+    carries it on the handle for attribution. Never in `interactive_argv` (the
+    human-present resolve path does no attribution)."""
+    import uuid
+
+    adapter, spec, handle, argv = _launched(tmp_path, get_profile("claude"))
+
+    pinned = handle.pinned_session_id
+    assert pinned is not None
+    assert uuid.UUID(pinned).version == 4
+    assert argv[-2:] == ["--session-id", pinned]
+    assert argv[:-2] == adapter.interactive_argv(spec)
+    assert "--session-id" not in adapter.interactive_argv(spec)
+
+    # a fresh id per launch
+    _, _, again, _ = _launched(tmp_path / "second", get_profile("claude"))
+    assert again.pinned_session_id != pinned
+
+
+@pytest.mark.parametrize("profile_name", ["codex", "gemini", "copilot"])
+def test_generic_adapter_without_session_id_flag_launches_unpinned(tmp_path, no_tmux, profile_name):
+    """A profile without `session_id_flag` keeps today's argv exactly and an
+    unpinned handle."""
+    profile = get_profile(profile_name)
+    assert profile.session_id_flag == ""
+    adapter, spec, handle, argv = _launched(tmp_path, profile)
+    assert handle.pinned_session_id is None
+    assert argv == adapter.interactive_argv(spec)
+
+
+def test_generic_adapter_empty_session_id_flag_launches_unpinned(tmp_path, no_tmux):
+    """An overlay that blanks claude's flag turns pinning off."""
+    import dataclasses
+
+    adapter, spec, handle, argv = _launched(
+        tmp_path, dataclasses.replace(get_profile("claude"), session_id_flag="")
+    )
+    assert handle.pinned_session_id is None
+    assert "--session-id" not in argv
+    assert argv == adapter.interactive_argv(spec)
 
 
 # --------------------------------------------------------------- seam honesty
@@ -1375,6 +1435,13 @@ def test_new_window_posix_argv_byte_identical(monkeypatch, tmp_path):
         "A=1",
         "-e",
         "B=2",
+        # DW-507: a POSIX prelude records the launched pid, then execs the pane's
+        # $SHELL (tmux's default-shell) on the command, passed as $1. The program
+        # is absolute, so a profile's [env] PATH overlay cannot re-point it.
+        "/bin/sh",
+        "-c",
+        'BMAD_LOOP_LAUNCH_PID=$$; export BMAD_LOOP_LAUNCH_PID; exec "${SHELL:-/bin/sh}" -c "$1"',
+        "sh",
         "cmd",
     ]
 
@@ -1383,14 +1450,15 @@ def test_new_window_posix_command_reaches_tmux_verbatim(monkeypatch, tmp_path):
     # The contract says `command` is a shlex-joined argv, not a shell line.
     # The POSIX leaf must not parse or re-quote it: whatever the caller built
     # arrives at tmux as one verbatim trailing argument, so operator-looking
-    # tokens the caller quoted (here a literal "&&" argument) survive intact.
+    # tokens the caller quoted (here a literal "&&" argument) survive intact —
+    # as the DW-507 prelude's `$1`, never spliced into its source.
     rec = _RecordRun()
     monkeypatch.setattr(tmux_base.subprocess, "run", rec)
 
     command = shlex.join(["echo", "a b", "&&", "reboot"])
     TmuxMultiplexer().new_window("s", "n", tmp_path, {}, command)
 
-    assert rec.argv == [
+    assert rec.argv[:11] == [
         "tmux",
         "new-window",
         "-t",
@@ -1402,8 +1470,105 @@ def test_new_window_posix_command_reaches_tmux_verbatim(monkeypatch, tmp_path):
         "-P",
         "-F",
         "#{window_id}",
-        command,
     ]
+    assert rec.argv[-5:] == ["/bin/sh", "-c", tmux_base.LAUNCH_PRELUDE, "sh", command]
+    assert len(rec.argv) == 16
+
+
+_PID_PROBE = (
+    "import os, sys; "
+    "sys.stdout.write(os.environ.get('BMAD_LOOP_LAUNCH_PID', '-') + ' ' "
+    "+ str(os.getpid()) + ' ' + str(os.getppid()))"
+)
+
+
+def _assert_launch_pid(stdout):
+    """The probe's recorded launch pid is its own (the shell exec'd the single
+    `-c` command: bash, zsh) or its parent's (the shell forked it: dash — the
+    Ubuntu CI `/bin/sh` — and fish). Either way the relays' launch-chain rule
+    reaches the launched pid; nothing further up may be recorded."""
+    seen, own, parent = stdout.split()
+    assert seen in (own, parent)
+
+
+def _launch_argv(monkeypatch, tmp_path, command):
+    """The trailing launch argv the POSIX leaf hands tmux for `command`."""
+    rec = _RecordRun()
+    with monkeypatch.context() as m:
+        m.setattr(tmux_base.subprocess, "run", rec)
+        TmuxMultiplexer().new_window("s", "n", tmp_path, {}, command)
+    tail = rec.argv[-5:]
+    assert tail[:2] == ["/bin/sh", "-c"]
+    return tail
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX sh")
+def test_new_window_launch_prelude_exports_the_launched_pid(monkeypatch, tmp_path):
+    """DW-507: the window's launch argv, run for real under `SHELL=/bin/sh`, hands
+    the command the launched pid in BMAD_LOOP_LAUNCH_PID — the prelude records
+    `$$` and `exec`s the shell; bash execs a single `-c` command, so `$$` is the
+    CLI's own pid, while dash (Ubuntu's `/bin/sh`) forks it, so `$$` is its
+    direct parent's. Either is what the relays walk their parent chain toward.
+    The command reaches the shell intact as `$1`.
+
+    Ablation: drop `export` from the prelude and the probe sees nothing."""
+    tail = _launch_argv(monkeypatch, tmp_path, shlex.join([sys.executable, "-c", _PID_PROBE]))
+    env = {k: v for k, v in os.environ.items() if k != "BMAD_LOOP_LAUNCH_PID"}
+    env["SHELL"] = "/bin/sh"
+    proc = subprocess.run(tail, env=env, capture_output=True, text=True, timeout=30)
+
+    assert proc.returncode == 0, proc.stderr
+    _assert_launch_pid(proc.stdout)
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX sh")
+def test_new_window_launch_runs_the_command_under_the_panes_shell(monkeypatch, tmp_path):
+    """DW-507 keeps tmux's `default-shell`: tmux sets `SHELL` to it in every pane,
+    and the prelude execs `$SHELL -c <command>` — so an operator's rc-file PATH
+    and shell functions still resolve the CLI, exactly as a bare
+    `new-window <command>` did. A `SHELL` pointing at a recording wrapper
+    proves the command runs under it, verbatim.
+
+    Ablation: make the prelude exec a bare `sh -c "$1"` and the record is never
+    written."""
+    record = tmp_path / "shell-invoked"
+    fake_shell = tmp_path / "fake-shell"
+    fake_shell.write_text(
+        "#!/bin/sh\n" f"printf '%s\\n' \"$@\" > {shlex.quote(str(record))}\n" 'exec /bin/sh "$@"\n'
+    )
+    fake_shell.chmod(0o755)
+    command = shlex.join([sys.executable, "-c", _PID_PROBE])
+    tail = _launch_argv(monkeypatch, tmp_path, command)
+    env = {k: v for k, v in os.environ.items() if k != "BMAD_LOOP_LAUNCH_PID"}
+    env["SHELL"] = str(fake_shell)
+    proc = subprocess.run(tail, env=env, capture_output=True, text=True, timeout=30)
+
+    assert proc.returncode == 0, proc.stderr
+    assert record.read_text().splitlines() == ["-c", command]
+    _assert_launch_pid(proc.stdout)
+
+
+class _ShellWrapOnlyLeaf(tmux_base.BaseTmuxBackend):
+    """An out-of-tree tmux-family leaf that swaps only `_shell_wrap` for its dialect."""
+
+    def _shell_wrap(self, source):
+        return ["pwsh", "-Command", source]
+
+
+def test_base_window_launch_stays_dialect_neutral(monkeypatch, tmp_path):
+    """The DW-507 launch-pid prelude is POSIX source, so it rides the POSIX leaf
+    only: a base-derived leaf that overrides `_shell_wrap` but inherits
+    `_window_launch` still hands its multiplexer the bare `-e` flags plus the
+    command, exactly as before DW-507 — never a `/bin/sh` its host may lack.
+
+    Ablation: move the prelude back into `BaseTmuxBackend._window_launch` and
+    the argv ends in `/bin/sh -c <prelude> sh <command>`."""
+    rec = _RecordRun()
+    monkeypatch.setattr(tmux_base.subprocess, "run", rec)
+
+    _ShellWrapOnlyLeaf().new_window("s", "n", tmp_path, {"K": "v"}, "claude --x")
+
+    assert rec.argv[11:] == ["-e", "K=v", "claude --x"]
 
 
 class _FakeDialect(TmuxMultiplexer):

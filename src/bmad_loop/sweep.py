@@ -1386,7 +1386,9 @@ def _hook_verdict(kinds: set[str]) -> str:
 def _diagnostic_suffix(diagnostic: dict[str, Any] | None) -> str:
     """The escalation-text tail for a non-completed session's diagnostic (#752):
     what was on disk and which hook events arrived, so an operator whose event
-    channel is miswired debugs the channel, not the agent's output."""
+    channel is miswired debugs the channel, not the agent's output. Nested-CLI
+    events attribution dropped are named too: ``foreign ignored`` counts foreign
+    ids (#767), ``foreign id-less events ignored`` the id-less events lineage dropped (DW-507)."""
     if diagnostic is None:
         return ""
     artifact = str(diagnostic["artifact"])
@@ -1395,6 +1397,8 @@ def _diagnostic_suffix(diagnostic: dict[str, Any] | None) -> str:
     hooks = str(diagnostic["hook_events"])
     if diagnostic.get("hook_foreign_ids"):
         hooks += f"; foreign ignored: {diagnostic['hook_foreign_ids']}"
+    if diagnostic.get("hook_foreign_idless"):
+        hooks += f"; foreign id-less events ignored: {diagnostic['hook_foreign_idless']}"
     return f" [result.json: {artifact}; hook events: {hooks}]"
 
 
@@ -4928,7 +4932,9 @@ class SweepEngine(Engine):
         so an earlier healthy attempt's events cannot mask this failure.
         ``hook_events``, ``hook_event_kinds`` and ``hook_event_count`` cover only the
         events ``signals.attribute_events`` admits as the launched session's (#767);
-        ``hook_foreign_ids`` counts the nested-CLI session ids it dropped.
+        ``hook_foreign_ids`` counts the nested-CLI session ids it dropped, and
+        ``hook_foreign_idless`` the id-less events it dropped — only a trusted
+        relay-side lineage ``mismatch`` drops those (DW-507).
 
         Observation degrades, never raises: this runs on a failure path that must
         still reach its retry/escalation decision."""
@@ -4986,6 +4992,12 @@ class SweepEngine(Engine):
             diagnostic["hook_event_kinds"] = sorted(kinds)
             diagnostic["hook_event_count"] = len(admitted)
             diagnostic["hook_foreign_ids"] = len(foreign)
+            # A trusted lineage (DW-507) also drops id-less nested-CLI events,
+            # which add no foreign id; count them so a dropped Stop is visible.
+            kept = {id(event) for event in admitted}
+            diagnostic["hook_foreign_idless"] = sum(
+                1 for event in events if id(event) not in kept and not event.session_id
+            )
         return diagnostic
 
     def _migrate_prompt(self, manifest: Path, feedback: Path | None) -> str:
