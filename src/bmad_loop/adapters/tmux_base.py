@@ -17,10 +17,10 @@ override is left for timeout tweaks) plus the shell-dialect hooks (``_shell_wrap
 :meth:`~BaseTmuxBackend.new_parked_window` the hooks replace method-body
 overrides entirely; :meth:`~BaseTmuxBackend.pipe_pane` still hands the
 multiplexer a POSIX ``cat >>`` redirection, so a non-POSIX leaf overrides it
-directly, alongside whatever divergences its multiplexer forces on it. Likewise
-the base ``_window_launch`` builds a literal POSIX ``/bin/sh -c`` launch-pid prelude
-(DW-507) rather than going through ``_shell_wrap``, so a leaf that overrides
-``_shell_wrap`` for another dialect overrides ``_window_launch`` too.
+directly, alongside whatever divergences its multiplexer forces on it. The
+POSIX launch-pid prelude (DW-507, :data:`LAUNCH_PRELUDE`) is added by the POSIX
+leaf's ``_window_launch``, not this base's, so a leaf that swaps ``_shell_wrap``
+for another dialect never inherits POSIX source.
 
 Every method that talks to tmux funnels through :meth:`BaseTmuxBackend._run`, the
 one place a subprocess is spawned. See :mod:`.multiplexer` for the contract.
@@ -53,7 +53,7 @@ LAUNCH_PID_ENV = "BMAD_LOOP_LAUNCH_PID"
 #: The POSIX ``sh -c`` source that records the launched pid and then runs the
 #: window's command (``$1``) under the pane's ``$SHELL`` — tmux's
 #: ``default-shell`` — exactly as a bare ``new-window <command>`` would
-#: (DW-507; see ``BaseTmuxBackend._window_launch``).
+#: (DW-507; see ``TmuxMultiplexer._window_launch``).
 LAUNCH_PRELUDE = f'{LAUNCH_PID_ENV}=$$; export {LAUNCH_PID_ENV}; exec "${{SHELL:-/bin/sh}}" -c "$1"'
 
 
@@ -454,34 +454,17 @@ class BaseTmuxBackend(TerminalMultiplexer):
         """Trailing ``new-window`` args: env injection plus the command itself.
 
         Part of the dialect seam because the env-injection *strategy* is
-        dialect-coupled: bare ``-e`` flags plus the launch-pid prelude below
-        here, an in-source prelude for a leaf whose shell wraps the command.
-
-        The command runs behind a small ``/bin/sh -c`` prelude (DW-507) that exports
-        :data:`LAUNCH_PID_ENV` as its own ``$$`` and then ``exec``s
-        ``"${SHELL:-/bin/sh}" -c <command>``: the relays need the launched
-        CLI's pid to tag hook lineage, and that pid is known only in-pane.
-        tmux's ``default-shell`` semantics are preserved — tmux sets ``SHELL``
-        to its ``default-shell`` in every pane (even over ``-e SHELL=``), so
-        the command runs under that shell exactly as before, and whatever it
-        sources for a ``-c`` command (fish's ``config.fish``, zsh's
-        ``.zshenv``) still applies. The program is the absolute ``/bin/sh``,
-        never a PATH lookup, so a profile's ``[env] PATH`` overlay cannot
-        re-point it. The prelude's ``exec`` keeps ``$$``
-        the pane's process: bash and zsh then exec a single ``-c`` command, so
-        the recorded pid IS the CLI's; fish and dash (Debian/Ubuntu ``/bin/sh``,
-        0.5.12) fork it, so the pid is the shell's and the relays' launch-chain
-        rule skips the CLI under it.
-
-        The prelude is POSIX source and is built as a LITERAL argv, not through
-        :meth:`_shell_wrap`: a leaf that overrides ``_shell_wrap`` for another
-        shell dialect must override this method too (psmux does), or it would
-        hand POSIX source to a non-POSIX shell.
+        dialect-coupled: bare ``-e`` flags plus the raw command here, an
+        in-source prelude for a leaf whose shell wraps the command. The POSIX
+        leaf (:class:`~.tmux_backend.TmuxMultiplexer`) adds its launch-pid
+        prelude on top; this base stays dialect-neutral, so a leaf that
+        overrides only :meth:`_shell_wrap` still gets a command its multiplexer
+        runs under its own ``default-shell``.
         """
         env_args: list[str] = []
         for key, value in env.items():
             env_args += ["-e", f"{key}={value}"]
-        return [*env_args, "/bin/sh", "-c", LAUNCH_PRELUDE, "sh", command]
+        return [*env_args, command]
 
     # ------------------------------------------------------------ windows
 

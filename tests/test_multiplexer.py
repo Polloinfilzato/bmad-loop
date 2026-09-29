@@ -1548,6 +1548,29 @@ def test_new_window_launch_runs_the_command_under_the_panes_shell(monkeypatch, t
     _assert_launch_pid(proc.stdout)
 
 
+class _ShellWrapOnlyLeaf(tmux_base.BaseTmuxBackend):
+    """An out-of-tree tmux-family leaf that swaps only `_shell_wrap` for its dialect."""
+
+    def _shell_wrap(self, source):
+        return ["pwsh", "-Command", source]
+
+
+def test_base_window_launch_stays_dialect_neutral(monkeypatch, tmp_path):
+    """The DW-507 launch-pid prelude is POSIX source, so it rides the POSIX leaf
+    only: a base-derived leaf that overrides `_shell_wrap` but inherits
+    `_window_launch` still hands its multiplexer the bare `-e` flags plus the
+    command, exactly as before DW-507 — never a `/bin/sh` its host may lack.
+
+    Ablation: move the prelude back into `BaseTmuxBackend._window_launch` and
+    the argv ends in `/bin/sh -c <prelude> sh <command>`."""
+    rec = _RecordRun()
+    monkeypatch.setattr(tmux_base.subprocess, "run", rec)
+
+    _ShellWrapOnlyLeaf().new_window("s", "n", tmp_path, {"K": "v"}, "claude --x")
+
+    assert rec.argv[11:] == ["-e", "K=v", "claude --x"]
+
+
 class _FakeDialect(TmuxMultiplexer):
     """A leaf that overrides ONLY the dialect hooks — no contract method bodies."""
 

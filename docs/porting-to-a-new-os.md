@@ -113,11 +113,12 @@ out-of-tree adapter is
   **without editing** `tmux_base.py` or its POSIX leaf `tmux_backend.py`
   (`TmuxMultiplexer`). The one method-body override left is `pipe_pane`, whose
   POSIX `cat >>` redirection is not behind a hook. The base `_window_launch` is
-  POSIX-only: it builds a literal `/bin/sh -c` prelude that records the launched pid
-  for the relays' hook lineage (DW-507) and then execs `$SHELL -c <command>`,
-  without going through `_shell_wrap`. A leaf that overrides `_shell_wrap` for
-  another shell dialect must override `_window_launch` too (psmux does; with no
-  `/proc` there, its hook lineage reads `unknown` anyway).
+  dialect-neutral (`-e` flags plus the raw command); the POSIX `TmuxMultiplexer`
+  leaf adds a literal `/bin/sh -c` prelude that records the launched pid for the
+  relays' hook lineage (DW-507) and then execs `$SHELL -c <command>`. A leaf on
+  the base that does not record `BMAD_LOOP_LAUNCH_PID` gets `unknown` lineage,
+  which attribution ignores (psmux; with no `/proc` there, its lineage reads
+  `unknown` anyway).
 - **Implement `TerminalMultiplexer` fresh** when the host has no tmux-shaped CLI
   at all (e.g. a ConPTY-based window manager). You implement the full contract
   directly; `tmux_backend.py` is the reference for what each method must produce.
@@ -248,8 +249,8 @@ If your transport namespaces, four rules:
   about, precisely because the _other_ windows ride inheritance); an env dict a
   caller passed explicitly must survive regardless, and an in-command transport
   is the one that does. `_window_launch` is the dialect hook that owns each
-  family dialect's answer; the base one is a literal POSIX prelude (DW-507), so
-  a non-POSIX leaf overrides it alongside `_shell_wrap`.
+  family dialect's answer; the base one passes bare `-e` flags, and a leaf
+  whose shell wraps the command (psmux) overrides it alongside `_shell_wrap`.
 - **Answer `has_registry_namespace()`, `registry_root()` and
   `legacy_registries()`.** The first tells cleanup your transport namespaces
   sessions at all, so a registry with no root in force reads as the shared
