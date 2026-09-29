@@ -1882,9 +1882,13 @@ JOURNAL_RECEIVERS = {"journal", "_journal"}
 # sys.platform branch; the Unity teardown scripts are POSIX-only. verify.py is the
 # one non-platform case: git's *diff format* spells an absent file `/dev/null` on
 # every platform, so `patch_new_files` compares against it as a protocol token.
+# The two relay twins read `/proc/<pid>/{stat,cmdline}` for the DW-507 lineage tag;
+# a platform without `/proc` fails the open and tags "unknown" by construction.
 PATH_ALLOW = {
+    "data/bmad_loop_hook.py",
     "data/plugins/unity/unity_cleanup.py",
     "data/plugins/unity/unity_teardown.py",
+    "events.py",
     "process_host.py",
     "verify.py",
 }
@@ -1961,6 +1965,9 @@ SESSION_PROTOCOL_ENV = (
     "BMAD_LOOP_CLEAN_TMP",
     "BMAD_LOOP_QUIESCE_PHASE",
     "BMAD_LOOP_PROBE_CAPTURE_DIR",
+    # DW-507: the launched CLI's pid, exported in-pane by `tmux_base._window_launch`
+    # and read back only by the two relay twins' lineage walk.
+    "BMAD_LOOP_LAUNCH_PID",
 )
 
 # The plugin's own families, which AGENTS.md's second clause leaves with the plugin

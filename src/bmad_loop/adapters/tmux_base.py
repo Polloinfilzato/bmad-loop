@@ -17,7 +17,10 @@ override is left for timeout tweaks) plus the shell-dialect hooks (``_shell_wrap
 :meth:`~BaseTmuxBackend.new_parked_window` the hooks replace method-body
 overrides entirely; :meth:`~BaseTmuxBackend.pipe_pane` still hands the
 multiplexer a POSIX ``cat >>`` redirection, so a non-POSIX leaf overrides it
-directly, alongside whatever divergences its multiplexer forces on it.
+directly, alongside whatever divergences its multiplexer forces on it. Likewise
+the base ``_window_launch`` builds a literal POSIX ``/bin/sh -c`` launch-pid prelude
+(DW-507) rather than going through ``_shell_wrap``, so a leaf that overrides
+``_shell_wrap`` for another dialect overrides ``_window_launch`` too.
 
 Every method that talks to tmux funnels through :meth:`BaseTmuxBackend._run`, the
 one place a subprocess is spawned. See :mod:`.multiplexer` for the contract.
@@ -42,6 +45,16 @@ TMUX_TIMEOUT_S = 30
 # targets (bare %N on tmux, =session:%N on psmux — see
 # TerminalMultiplexer.current_return_target), so this never collides with one.
 PARKED_RETURN_DETACH = "detach"
+#: Names the launched CLI's pid inside a coding-CLI window (DW-507). The relays
+#: walk their own parent chain against it to tag each hook event's lineage, so a
+#: nested CLI's hooks can be told from the launched one's. A session-protocol
+#: variable read only by the stdlib relays, so it is not in ``envvars``.
+LAUNCH_PID_ENV = "BMAD_LOOP_LAUNCH_PID"
+#: The POSIX ``sh -c`` source that records the launched pid and then runs the
+#: window's command (``$1``) under the pane's ``$SHELL`` — tmux's
+#: ``default-shell`` — exactly as a bare ``new-window <command>`` would
+#: (DW-507; see ``BaseTmuxBackend._window_launch``).
+LAUNCH_PRELUDE = f'{LAUNCH_PID_ENV}=$$; export {LAUNCH_PID_ENV}; exec "${{SHELL:-/bin/sh}}" -c "$1"'
 
 
 class TmuxError(MultiplexerError):
@@ -441,13 +454,33 @@ class BaseTmuxBackend(TerminalMultiplexer):
         """Trailing ``new-window`` args: env injection plus the command itself.
 
         Part of the dialect seam because the env-injection *strategy* is
-        dialect-coupled: bare ``-e`` flags plus the raw command here, an
-        in-source prelude for a leaf whose shell wraps the command.
+        dialect-coupled: bare ``-e`` flags plus the launch-pid prelude below
+        here, an in-source prelude for a leaf whose shell wraps the command.
+
+        The command runs behind a small ``/bin/sh -c`` prelude (DW-507) that exports
+        :data:`LAUNCH_PID_ENV` as its own ``$$`` and then ``exec``s
+        ``"${SHELL:-/bin/sh}" -c <command>``: the relays need the launched
+        CLI's pid to tag hook lineage, and that pid is known only in-pane.
+        tmux's ``default-shell`` semantics are preserved — tmux sets ``SHELL``
+        to its ``default-shell`` in every pane (even over ``-e SHELL=``), so
+        the command runs under that shell exactly as before, and whatever it
+        sources for a ``-c`` command (fish's ``config.fish``, zsh's
+        ``.zshenv``) still applies. The program is the absolute ``/bin/sh``,
+        never a PATH lookup, so a profile's ``[env] PATH`` overlay cannot
+        re-point it. The prelude's ``exec`` keeps ``$$``
+        the pane's process: bash, zsh and dash then exec a single ``-c``
+        command, so the recorded pid IS the CLI's; fish forks it, so the pid is
+        fish's and the relays' launch-chain rule skips the CLI under it.
+
+        The prelude is POSIX source and is built as a LITERAL argv, not through
+        :meth:`_shell_wrap`: a leaf that overrides ``_shell_wrap`` for another
+        shell dialect must override this method too (psmux does), or it would
+        hand POSIX source to a non-POSIX shell.
         """
         env_args: list[str] = []
         for key, value in env.items():
             env_args += ["-e", f"{key}={value}"]
-        return [*env_args, command]
+        return [*env_args, "/bin/sh", "-c", LAUNCH_PRELUDE, "sh", command]
 
     # ------------------------------------------------------------ windows
 

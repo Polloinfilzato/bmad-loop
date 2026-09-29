@@ -75,7 +75,9 @@ a broken package degrades to a `bmad-loop mux` warning, never a selection failur
 for a tmux-family backend — overriding only its single spawn primitive `_run()`
 plus the shell-dialect hooks (`_shell_wrap`, `_join_argv`, `_parked_trailer`,
 `_source_prefix`, `_window_launch` and the `_EXIT_CAPTURE`/`_ECHO`/`_PARK`
-fragments) — or implement
+fragments; the base `_window_launch` is a literal POSIX `/bin/sh -c` launch-pid
+prelude, DW-507, so a leaf overriding `_shell_wrap` for another dialect
+overrides `_window_launch` too) — or implement
 `TerminalMultiplexer` fresh for a host with no tmux-shaped CLI. The non-transport
 seams of a full OS port are in
 [Porting bmad-loop to a new OS](porting-to-a-new-os.md). The contract groups into:

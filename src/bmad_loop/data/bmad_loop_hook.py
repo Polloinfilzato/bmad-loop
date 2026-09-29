@@ -27,10 +27,20 @@ mirror-image skew — an older orchestrator that sets only RUN_DIR/TASK_ID drivi
 a session whose installed relay is this newer file — must still write its
 events, and requiring the new variable would silently stall every one of those
 runs instead.
+
+Every event also carries a `lineage` tag (DW-507): "match" when the CLI bmad-loop
+launched (the tmux launch records its pid, or its forking shell's, in
+$BMAD_LOOP_LAUNCH_PID) fired the hook itself, "mismatch" when something else
+in between did — a nested coding CLI started from inside the session inherits
+this whole environment, so its hooks reach here too — and "unknown" when that
+cannot be read (no /proc, an older orchestrator that sets no launch pid). It
+only tags: the event is written either way, and the orchestrator decides what
+a mismatch means.
 """
 
 import json
 import os
+import re
 import stat
 import sys
 import time
@@ -72,6 +82,113 @@ def _source(payload):
     # string is forwarded, like the notification subtype above.
     value = payload.get("source")
     return value if isinstance(value, str) else None
+
+
+# How long after the launched CLI the rest of its launch chain may start
+# (DW-507): a forking default-shell starts the CLI and a node shim starts the
+# real binary at once. Limitation: anything the CLI itself starts at launch (an
+# MCP server, a project SessionStart hook running another CLI) also falls inside
+# the window and reads "match", so only the #767 rules apply to it; only what an
+# agent starts after a model turn is reliably outside it.
+_LAUNCH_SHIM_WINDOW_S = 5
+
+
+def _proc_stat(pid):
+    """`(ppid, starttime in clock ticks)` from `/proc/<pid>/stat`, or None when
+    the process is gone or there is no `/proc` (Windows, macOS).
+
+    The comm field is parenthesized and may itself hold spaces or ")", so the
+    fields are split after the LAST ")": state is index 0 there, ppid index 1,
+    and starttime index 19 (fields 4 and 22 of proc(5))."""
+    path = f"/proc/{pid}/stat"  # portability: Linux-only; absent elsewhere -> None
+    try:
+        with open(path, "rb") as handle:
+            data = handle.read()
+    except (OSError, ValueError):
+        return None
+    fields = data[data.rfind(b")") + 1 :].split()
+    try:
+        return int(fields[1]), int(fields[19])
+    except (IndexError, ValueError):
+        return None
+
+
+def _cmdline(pid):
+    # The process's argv as one space-joined string; "" when it cannot be read.
+    path = f"/proc/{pid}/cmdline"  # portability: Linux-only; absent elsewhere -> ""
+    try:
+        with open(path, "rb") as handle:
+            data = handle.read()
+    except (OSError, ValueError):
+        return ""
+    return data.replace(b"\0", b" ").decode("utf-8", "replace")
+
+
+def _lineage(event_name, marker):
+    """Whether the process that fired this hook is the CLI bmad-loop launched
+    (DW-507): "match", "mismatch", or "unknown".
+
+    A nested coding CLI started from inside the session inherits the relay
+    environment, so its hooks land in the parent's event stream. The tmux
+    launch records the launched pid in $BMAD_LOOP_LAUNCH_PID; this walks the
+    relay's own parent chain toward it. Being a descendant is not enough — a
+    CLI started from the launched CLI's Bash tool is one — so the walk skips
+    only what a hook invocation legitimately puts in between:
+      - the launch chain: any process started within _LAUNCH_SHIM_WINDOW_S of
+        the launched pid. A forking default-shell (fish) is the launched pid
+        and the CLI its child; a node shim's real binary is a child again.
+        Whatever the CLI starts at launch (MCP servers, a SessionStart hook
+        running another CLI) is inside the window too and reads "match".
+      - a hook-command wrapper: its cmdline holds `marker` as a substring and
+        the event name as a whole token, split on whitespace, quotes and shell
+        operators (so `sh -c '.../bmad-loop relay Stop && true'` counts).
+    Any other process on the way is a nested CLI or its shell: "mismatch". So
+    is reaching pid 1 or below without meeting the launched pid while it is
+    alive: a process from another tree.
+
+    "unknown" whenever the answer cannot be read: the variable unset or not a
+    pid, no `/proc` (Windows, macOS), the launched process gone, a process
+    vanishing mid-walk, more than 64 hops, or any unexpected fault. The tag
+    only informs the orchestrator; it never stops the event from being written.
+    """
+    try:
+        try:
+            launch_pid = int(os.environ.get("BMAD_LOOP_LAUNCH_PID") or "")
+        except ValueError:
+            return "unknown"
+        if launch_pid <= 1:
+            return "unknown"
+        launch = _proc_stat(launch_pid)
+        if launch is None:
+            return "unknown"
+        try:
+            ticks = os.sysconf("SC_CLK_TCK")
+        except (AttributeError, OSError, ValueError):
+            return "unknown"
+        if ticks <= 0:
+            return "unknown"
+        chain_window = _LAUNCH_SHIM_WINDOW_S * ticks
+        pid = os.getppid()
+        for _hop in range(64):
+            if pid == launch_pid:
+                return "match"
+            if pid <= 1:
+                return "mismatch"
+            current = _proc_stat(pid)
+            if current is None:
+                return "unknown"
+            parent, started = current
+            if 0 <= started - launch[1] <= chain_window:
+                pid = parent
+                continue
+            cmdline = _cmdline(pid)
+            if marker in cmdline and event_name in re.split(r"[\s;&|()<>'\"`]+", cmdline):
+                pid = parent
+                continue
+            return "mismatch"
+        return "unknown"
+    except Exception:
+        return "unknown"
 
 
 def _is_link_like(path):
@@ -232,6 +349,9 @@ def main() -> int:
         # is still the launched session, so attribution rebinds instead of
         # reading it as a nested CLI. Kept only when it is a string.
         "source": _source(payload),
+        # Whether the launched CLI itself fired this hook (DW-507): a tag, never
+        # a filter — the orchestrator decides what a "mismatch" means.
+        "lineage": _lineage(event_name, "bmad_loop_hook"),
     }
     # The orchestrator's own events dir when it named one, else the legacy
     # in-tree location this file's older selves are still installed at (see the

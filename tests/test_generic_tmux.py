@@ -807,7 +807,7 @@ class _ScriptedWatcher:
         return self._events.pop(0) if self._events else None
 
 
-def _stop_event(task_id, session_id, transcript_path):
+def _stop_event(task_id, session_id, transcript_path, lineage=None):
     return HookEvent(
         ts=1,
         event="Stop",
@@ -815,6 +815,7 @@ def _stop_event(task_id, session_id, transcript_path):
         session_id=session_id,
         transcript_path=transcript_path,
         path=Path("x"),
+        lineage=lineage,
     )
 
 
@@ -1934,7 +1935,8 @@ def test_wait_for_completion_keeps_matching_parent_session_end_crash(tmp_path):
     assert result.status == "crashed"
     assert result.session_id == outer_id
     assert result.transcript_path == "/outer.jsonl"
-    assert _lifecycle_lines(adapter) == []
+    # An untagged (pre-DW-507) start leaves lineage unavailable: that crumb, no other.
+    assert [entry["event"] for entry in _lifecycle_lines(adapter)] == ["hook-lineage-untrusted"]
 
 
 def test_wait_for_completion_preserves_no_id_hook_compatibility(tmp_path):
@@ -1956,7 +1958,171 @@ def test_wait_for_completion_preserves_no_id_hook_compatibility(tmp_path):
     assert result.status == "completed"
     assert result.session_id is None
     assert result.transcript_path == "/legacy.jsonl"
-    assert _lifecycle_lines(adapter) == []
+    # An untagged (pre-DW-507) start leaves lineage unavailable: that crumb, no other.
+    assert [entry["event"] for entry in _lifecycle_lines(adapter)] == ["hook-lineage-untrusted"]
+
+
+def test_trusted_lineage_drops_a_nested_childs_clear_rotation_and_stop(tmp_path):
+    """DW-507: once the launched session's first SessionStart is tagged
+    `lineage: "match"`, a `mismatch`-tagged event is foreign. The case the #767
+    rules alone cannot catch: a nested child rotating its id with a `clear`
+    start and no preceding SessionEnd would rebind, and its Stop would then
+    complete the session under the child's identity. Here both are dropped and
+    the parent's own Stop completes it.
+
+    Ablation: delete the trusted-mismatch check at the top of
+    `SessionAttribution.admit` and this fails — the session completes on the
+    child's Stop with the child's id and transcript."""
+    adapter, impl = make_dev_adapter(tmp_path)
+    (impl / "spec-3-1-foo.md").write_text(
+        "---\nstatus: done\n---\n\n## Auto Run Result\n\nStatus: done\n"
+    )
+    adapter.watcher = _ScriptedWatcher(
+        [
+            _hook_event(
+                "SessionStart", session_id="outer", transcript_path="/outer.jsonl", lineage="match"
+            ),
+            _hook_event(
+                "SessionStart",
+                session_id="child-new",
+                transcript_path="/child.jsonl",
+                source="clear",
+                lineage="mismatch",
+            ),
+            _stop_event("3-1-dev-1", "child-new", "/child.jsonl", lineage="mismatch"),
+            _stop_event("3-1-dev-1", "outer", "/outer.jsonl", lineage="match"),
+        ]
+    )
+
+    result = adapter.wait_for_completion(_dev_handle(), _dev_spec(tmp_path))
+
+    assert result.status == "completed"
+    assert result.session_id == "outer"
+    assert result.transcript_path == "/outer.jsonl"
+    lines = _lifecycle_lines(adapter)
+    assert [entry["event"] for entry in lines] == ["foreign-hook-event-ignored"]
+    assert lines[0] == {
+        "ts": lines[0]["ts"],
+        "event": "foreign-hook-event-ignored",
+        "hook_event": "SessionStart",
+        "foreign_session_id": "child-new",
+        "dropped_so_far": 1,
+    }
+
+
+def test_trusted_lineage_drops_id_less_mismatch_stops_and_crumbs_them_once(tmp_path):
+    """DW-507: id-less events used to always pass attribution. Under a trusted
+    lineage an id-less `mismatch` Stop is a nested child's and is dropped; the
+    drops share one crumb (`foreign_session_id: null`, the #767 shape), an
+    empty-string id included.
+
+    Ablation: key the dedup on the raw `session_id` and a second crumb with
+    `foreign_session_id: ""` appears; delete the trusted-mismatch check in `SessionAttribution.admit`
+    and this fails — the first id-less Stop completes the session with the
+    child's transcript."""
+    adapter, impl = make_dev_adapter(tmp_path)
+    (impl / "spec-3-1-foo.md").write_text(
+        "---\nstatus: done\n---\n\n## Auto Run Result\n\nStatus: done\n"
+    )
+    adapter.watcher = _ScriptedWatcher(
+        [
+            _hook_event(
+                "SessionStart", session_id="outer", transcript_path="/outer.jsonl", lineage="match"
+            ),
+            _stop_event("3-1-dev-1", None, "/child.jsonl", lineage="mismatch"),
+            # An empty-string id is id-less too: it shares the None-keyed crumb.
+            _stop_event("3-1-dev-1", "", "/child.jsonl", lineage="mismatch"),
+            _stop_event("3-1-dev-1", "outer", "/outer.jsonl", lineage="match"),
+        ]
+    )
+
+    result = adapter.wait_for_completion(_dev_handle(), _dev_spec(tmp_path))
+
+    assert result.status == "completed"
+    assert result.session_id == "outer"
+    assert result.transcript_path == "/outer.jsonl"
+    (crumb,) = _lifecycle_lines(adapter)
+    assert crumb == {
+        "ts": crumb["ts"],
+        "event": "foreign-hook-event-ignored",
+        "hook_event": "Stop",
+        "foreign_session_id": None,
+        "dropped_so_far": 1,
+    }
+
+
+def test_trusted_lineage_mismatch_stop_is_counted_not_completed(tmp_path, monkeypatch):
+    """DW-507 acceptance: a nested child's `mismatch` Stop after a `match` first
+    start never completes the session, and it is counted in
+    `foreign_hook_events` where an operator looks (timeout-fired, heartbeat)."""
+    adapter, clock = _timeout_clock_adapter(tmp_path, monkeypatch)
+    adapter._stall_grace_s = 0.0
+
+    def advance(call_n):
+        if call_n > 2:
+            clock["mono"] += 1000.0
+
+    adapter.watcher = _ScriptedWatcher(
+        [
+            _hook_event("SessionStart", session_id="parent", lineage="match"),
+            _stop_event("3-1-dev-1", "child", None, lineage="mismatch"),
+        ],
+        on_call=advance,
+    )
+    result = adapter.wait_for_completion(_dev_handle(), _short_spec(tmp_path, timeout_s=100.0))
+
+    assert result.status == "timeout"
+    assert result.stop_seen is False
+    (fired,) = _lifecycle_events(adapter, "timeout-fired")
+    assert fired["foreign_hook_events"] == 1
+
+
+@pytest.mark.parametrize(
+    ("first_tag", "reason"),
+    [("mismatch", "miscalibrated"), ("unknown", "unavailable"), (None, "unavailable")],
+)
+def test_untrusted_lineage_crumbs_once_and_keeps_the_767_rules(tmp_path, first_tag, reason):
+    """DW-507: a first SessionStart not tagged `match` leaves lineage untrusted
+    for the attempt — a `mismatch` Stop is admitted exactly as before — and the
+    degrade is visible as ONE `hook-lineage-untrusted` crumb carrying the reason
+    and the first start's tag, however many starts follow.
+
+    Ablation: delete the crumb in `wait_for_completion` and this fails; drop the
+    `lineage_crumbed` latch and the second start crumbs again."""
+    adapter, impl = make_dev_adapter(tmp_path)
+    (impl / "spec-3-1-foo.md").write_text(
+        "---\nstatus: done\n---\n\n## Auto Run Result\n\nStatus: done\n"
+    )
+    adapter.watcher = _ScriptedWatcher(
+        [
+            _hook_event(
+                "SessionStart",
+                session_id="outer",
+                transcript_path="/outer.jsonl",
+                lineage=first_tag,
+            ),
+            _hook_event(
+                "SessionStart",
+                session_id="outer",
+                transcript_path="/outer.jsonl",
+                source="compact",
+                lineage=first_tag,
+            ),
+            _stop_event("3-1-dev-1", "outer", "/outer.jsonl", lineage="mismatch"),
+        ]
+    )
+
+    result = adapter.wait_for_completion(_dev_handle(), _dev_spec(tmp_path))
+
+    assert result.status == "completed"
+    assert result.session_id == "outer"
+    (crumb,) = _lifecycle_lines(adapter)
+    assert crumb == {
+        "ts": crumb["ts"],
+        "event": "hook-lineage-untrusted",
+        "reason": reason,
+        "lineage": first_tag,
+    }
 
 
 def test_wait_for_completion_transcriptless_stop_is_terminal_without_flag(tmp_path):
@@ -9224,6 +9390,7 @@ def _hook_event(
     session_id="sess",
     transcript_path=None,
     source=None,
+    lineage=None,
 ):
     return HookEvent(
         ts=1,
@@ -9234,6 +9401,7 @@ def _hook_event(
         path=Path("x"),
         notification_type=notification_type,
         source=source,
+        lineage=lineage,
     )
 
 

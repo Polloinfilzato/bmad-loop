@@ -2342,6 +2342,106 @@ def test_e2e_nested_child_cli_events_do_not_end_the_parent(tmp_path):
     ]
 
 
+# DW-507: the real relay, not `printf`, writes this variant's hook events, so each
+# carries the relay's `lineage` tag computed from the REAL pane process tree the
+# tmux launch prelude produced. The parent fires its SessionStart and Stop through
+# a non-exec'ing `sh -c '<relay> relay <Event> && true'` wrapper, the shape a hook
+# host gives the registered command; a nested child script (a separate file whose
+# cmdline holds neither relay marker nor event name) fires an ID-LESS Stop through
+# the same relay once the 5 s launch window has passed.
+_FAKE_SESSION_START = """printf '{"ts": %s, "event": "SessionStart", "task_id": "%s", "session_id": "fake-1"}' \\
+    "$ts" "$tid" > "$ed/$ts-$tid-SessionStart.json"
+"""
+_FAKE_STORY_STOP = """ts2=$(( ts + 1 ))
+printf '{"ts": %s, "event": "Stop", "task_id": "%s", "session_id": "fake-1"}' \\
+    "$ts2" "$tid" > "$ed/$ts2-$tid-Stop.json"
+sleep 30
+"""
+assert FAKE_CLI.count(_FAKE_SESSION_START) == 1 and FAKE_CLI.endswith(_FAKE_STORY_STOP)
+_VENV_RELAY = Path(sys.executable).parent / "bmad-loop"
+
+
+def _relay_call(relay: Path, event: str, payload: str) -> str:
+    """A shell line piping `payload` into `<relay> relay <event>` behind a
+    non-exec'ing `sh -c` wrapper (the trailing `&& true` keeps it a list)."""
+    inner = f"{shlex.quote(str(relay))} relay {event} && true"
+    return f"printf '%s' {shlex.quote(payload)} | sh -c {shlex.quote(inner)}\n"
+
+
+def _lineage_fake_cli(relay: Path, nested_child: Path) -> str:
+    start = _relay_call(relay, "SessionStart", '{"session_id": "fake-1"}')
+    child = (
+        "# past the relays' 5 s launch window, so only lineage can call the child's\n"
+        "# tool shell foreign, then the nested child's id-less Stop\n"
+        f"sleep 6\n{shlex.quote(str(nested_child))}\nsleep 2\n"
+    )
+    stop = _relay_call(relay, "Stop", '{"session_id": "fake-1"}') + "sleep 30\n"
+    fake = FAKE_CLI.replace(_FAKE_SESSION_START, start + child)
+    return fake[: -len(_FAKE_STORY_STOP)] + stop
+
+
+@pytest.mark.skipif(not _VENV_RELAY.is_file(), reason="no bmad-loop console script beside python")
+def test_e2e_relay_lineage_drops_a_nested_childs_id_less_stop(tmp_path):
+    """DW-507 end to end, zero tokens: the real tmux launch prelude records the
+    launched pid, the REAL relay tags every event from the real process tree,
+    and attribution acts on it. The parent's first SessionStart reads `match`,
+    so lineage is trusted; the nested child's id-less Stop reads `mismatch` and
+    is dropped (the #767 rules alone admit any id-less event, so it would have
+    completed the session before the parent wrote its spec); the parent's own
+    Stop, fired after the launch window through a real wrapper, reads `match`
+    and completes the story.
+
+    Ablation guards: drop the prelude from `_window_launch` and every tag is
+    `unknown` (the lineage assert fails); delete the trusted-mismatch check in
+    `SessionAttribution.admit` and the `foreign-hook-event-ignored` assert
+    fails. The outcome asserts alone do NOT catch the latter: the child's Stop
+    then ends the wait result-less, but the Stop read-back grace outlasts the
+    parent's spec write, so the story still reaches `done`."""
+    nested_dir = tmp_path / "nested"
+    nested_dir.mkdir()
+    nested_child = nested_dir / "child.sh"
+    nested_child.write_text(
+        "#!/bin/sh\n" + _relay_call(_VENV_RELAY, "Stop", "{}"), encoding="utf-8"
+    )
+    os.chmod(nested_child, 0o755)
+    fake_text = _lineage_fake_cli(_VENV_RELAY, nested_child)
+    assert '"event": "SessionStart"' not in fake_text, "the start splice did not take"
+
+    root = tmp_path / "sbx"
+    _scaffold(root, [_entry("1")])
+    fake = root / ".bmad-loop" / "fake-cli.sh"
+    fake.write_text(fake_text, encoding="utf-8")
+    _git(root, "commit", "-q", "-am", "lineage fake")
+    base = _commit_count(root)
+
+    proc = _run(root, "run")
+    assert proc.returncode == 0, proc.stderr or proc.stdout
+    assert _status(root, "1") == "done"
+    assert _commit_count(root) == base + 1
+
+    run_id = _run_id(root)
+    recorded = [
+        json.loads(path.read_text(encoding="utf-8"))
+        for path in sorted(runs.events_dir_for(root, run_id).glob("*.json"))
+    ]
+    tags = [(e["event"], e["session_id"], e["lineage"]) for e in recorded]
+    assert tags == [
+        ("SessionStart", "fake-1", "match"),
+        ("Stop", None, "mismatch"),
+        ("Stop", "fake-1", "match"),
+    ], tags
+
+    lifecycle = root / ".bmad-loop" / "runs" / run_id / "tasks"
+    crumbs = [
+        json.loads(line)
+        for path in lifecycle.glob("*/session-lifecycle.jsonl")
+        for line in path.read_text(encoding="utf-8").splitlines()
+    ]
+    assert not [c for c in crumbs if c["event"] == "hook-lineage-untrusted"]
+    ignored = [c for c in crumbs if c["event"] == "foreign-hook-event-ignored"]
+    assert [(c["foreign_session_id"], c["hook_event"]) for c in ignored] == [(None, "Stop")]
+
+
 def test_e2e_sprint_mode_regression(tmp_path):
     # Scenario 6 (audit MAJOR-2): the new folder+id-capable bmad-dev-auto skill is
     # installed, but this is a plain SPRINT-mode run. It must drive dev → verify →

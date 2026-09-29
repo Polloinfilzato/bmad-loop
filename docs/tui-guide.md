@@ -293,7 +293,12 @@ One row per story (or sweep bundle/triage task) in the selected run:
   `session-vanished` (the mux no longer reported the session during the run, #489),
   `foreign-hook-event-ignored` (a nested coding CLI's hook events dropped by session
   attribution, #767 — written once per foreign id, with `hook_event`,
-  `foreign_session_id`, and `dropped_so_far`, the running count of dropped events),
+  `foreign_session_id`, and `dropped_so_far`, the running count of dropped events;
+  id-less drops, which only a trusted relay-side lineage `mismatch` makes, share
+  one crumb with `foreign_session_id: null`, DW-507),
+  `hook-lineage-untrusted` (once per session when the first `SessionStart` could
+  not calibrate relay-side lineage, so only the #767 rules apply — `reason` is
+  `miscalibrated` or `unavailable`, `lineage` the first start's tag, DW-507),
   mux transport faults `liveness-probe-failed` / `liveness-probe-recovered` /
   `nudge-send-failed`, observation faults `parked-probe-failed` /
   `log-evidence-failed` / `result-json-refused` / `usage-sample-failed` /

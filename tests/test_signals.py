@@ -54,6 +54,30 @@ def test_parse_event_reads_the_session_start_source(tmp_path, extra, expected):
     assert event.source == expected
 
 
+@pytest.mark.parametrize(
+    ("extra", "expected"),
+    [
+        ({"lineage": "match"}, "match"),
+        ({"lineage": "mismatch"}, "mismatch"),
+        ({"lineage": "unknown"}, "unknown"),
+        ({"lineage": "MATCH"}, None),  # outside the tag set: dropped, not normalized
+        ({"lineage": "maybe"}, None),
+        ({"lineage": 1}, None),  # a non-string is dropped, not coerced
+        ({"lineage": ["match"]}, None),
+        ({}, None),  # an older vendored relay forwards no lineage at all
+    ],
+)
+def test_parse_event_keeps_only_a_known_lineage_tag(tmp_path, extra, expected):
+    """DW-507: the relay's lineage tag lands on the HookEvent only when it is one
+    of LINEAGE_TAGS, so attribution never keys on a value it does not know.
+
+    Ablation: drop the `in LINEAGE_TAGS` filter and the "MATCH"/"maybe" rows fail."""
+    watcher = SignalWatcher(tmp_path / "events")
+    write_event(watcher.events_dir, 1, "t1", "Stop", **extra)
+    (event,) = watcher.poll()
+    assert event.lineage == expected
+
+
 @pytest.mark.parametrize("value", [["A", "B"], {"id": "A"}, 3], ids=["list", "dict", "int"])
 def test_parse_event_drops_a_non_string_session_id(tmp_path, value):
     """#767: a non-string id reads as absent, so attribution never hashes it —
@@ -292,7 +316,7 @@ def test_is_session_event_is_the_rule_wait_for_matches_on(tmp_path):
     assert not is_session_event(event, "t2")
 
 
-def _event(kind, session_id=None, ts=1, source=None):
+def _event(kind, session_id=None, ts=1, source=None, lineage=None):
     return HookEvent(
         ts=ts,
         event=kind,
@@ -301,6 +325,7 @@ def _event(kind, session_id=None, ts=1, source=None):
         transcript_path=None,
         path=Path("x"),
         source=source,
+        lineage=lineage,
     )
 
 
@@ -625,3 +650,142 @@ def test_unpinned_attribution_still_admits_an_unannounced_end(sequence):
     assert _replay(attribution, sequence) == [True] * len(sequence)
     assert attribution.foreign_ids == set()
     assert not attribution.foreign_ended
+
+
+# DW-507: relay-side lineage, calibrated on the first SessionStart. One test per
+# row of the spec's Attribution matrix.
+
+
+def _replay_tagged(attribution, sequence):
+    """(kind, sid, source, lineage) tuples through `admit`."""
+    return [
+        attribution.admit(_event(kind, sid, source=source, lineage=lineage))
+        for kind, sid, source, lineage in sequence
+    ]
+
+
+def test_lineage_match_first_start_trusts_and_drops_a_mismatch_child():
+    """A `match` first start trusts lineage: a later `mismatch` event is foreign,
+    identified (its id joins foreign_ids, its SessionEnd sets foreign_ended) or
+    id-less."""
+    sequence = [
+        ("SessionStart", "A", "startup", "match"),
+        ("Stop", "C", None, "mismatch"),
+        ("Stop", None, None, "mismatch"),
+        ("SessionEnd", "C", None, "mismatch"),
+        ("Stop", "A", None, "match"),
+    ]
+    attribution = SessionAttribution()
+    assert _replay_tagged(attribution, sequence) == [True, False, False, False, True]
+    assert attribution.lineage_state == "trusted"
+    assert attribution.foreign_ids == {"C"}
+    assert attribution.foreign_ended and not attribution.bound_ended
+
+
+@pytest.mark.parametrize(
+    ("trusted_tag", "expected_admits", "expected_bound"),
+    [
+        pytest.param("match", [True, False, False, True], "A", id="trusted-drops-the-rotation"),
+        pytest.param("unknown", [True, True, True, True], "B", id="unavailable-rebinds"),
+        pytest.param(None, [True, True, True, True], "B", id="untagged-rebinds"),
+    ],
+)
+def test_lineage_closes_the_child_clear_rotation_only_when_trusted(
+    trusted_tag, expected_admits, expected_bound
+):
+    """The gap #767 left open: a nested child rotating its id with a `clear` start
+    and no preceding SessionEnd rebinds on `source` alone. Under a trusted
+    lineage the child's `mismatch` tag makes it foreign; with lineage
+    unavailable (Windows, macOS, an older relay) the #767 rule stands and it
+    rebinds exactly as before.
+
+    Ablation: delete the trusted-mismatch check at the top of `admit` and the
+    trusted row rebinds to B like the others."""
+    attribution = SessionAttribution()
+    sequence = [
+        ("SessionStart", "A", "startup", trusted_tag),
+        ("SessionStart", "B", "clear", "mismatch"),
+        ("Stop", "B", None, "mismatch"),
+        ("Stop", "A", None, trusted_tag),
+    ]
+    assert _replay_tagged(attribution, sequence) == expected_admits
+    assert attribution.bound_id == expected_bound
+
+
+def test_lineage_mismatch_first_start_is_miscalibrated_and_ignored():
+    """A `mismatch` first start means this CLI's hook architecture defeats the
+    relay heuristic: lineage is ignored for the attempt, so a later `mismatch`
+    Stop (id-less or from an unannounced id) is admitted as before."""
+    attribution = SessionAttribution()
+    sequence = [
+        ("SessionStart", "A", "startup", "mismatch"),
+        ("Stop", None, None, "mismatch"),
+        ("Stop", "A", None, "mismatch"),
+    ]
+    assert _replay_tagged(attribution, sequence) == [True, True, True]
+    assert attribution.lineage_state == "miscalibrated"
+    assert attribution.foreign_ids == set()
+
+
+@pytest.mark.parametrize("tag", ["unknown", None], ids=["unknown", "untagged"])
+def test_lineage_unknown_or_untagged_first_start_is_unavailable(tag):
+    attribution = SessionAttribution()
+    sequence = [("SessionStart", "A", "startup", tag), ("Stop", None, None, "mismatch")]
+    assert _replay_tagged(attribution, sequence) == [True, True]
+    assert attribution.lineage_state == "unavailable"
+
+
+def test_trusted_lineage_admits_a_mismatch_event_carrying_an_own_id():
+    """Fail toward acceptance: an event carrying one of the launched session's own
+    ids is never made foreign by lineage — it goes through the normal rules."""
+    attribution = SessionAttribution()
+    sequence = [
+        ("SessionStart", "A", "startup", "match"),
+        ("SessionEnd", "A", None, "match"),
+        ("SessionStart", "B", "clear", "match"),  # the parent's own rotation
+        ("Stop", "B", None, "mismatch"),
+        ("SessionEnd", "A", None, "mismatch"),  # late, from the rotated-away own id
+    ]
+    assert _replay_tagged(attribution, sequence) == [True] * 5
+    assert attribution.bound_id == "B"
+    assert attribution.foreign_ids == set()
+
+
+def test_lineage_is_ignored_before_the_first_start():
+    """The #727 path is unchanged: before the first SessionStart nothing is
+    calibrated, so a `mismatch` pre-start SessionEnd is still the parent's."""
+    attribution = SessionAttribution()
+    assert _replay_tagged(attribution, [("SessionEnd", "A", None, "mismatch")]) == [True]
+    assert attribution.lineage_state is None
+    assert attribution.bound_ended is False  # nothing bound yet; admitted, not recorded
+
+
+def test_trusted_mismatch_leaves_the_ended_flags_alone():
+    """A trusted-mismatch SessionStart is dropped without resetting the `*_ended`
+    evidence the normal SessionStart path clears: the parent's own end still
+    vouches for its next clear start."""
+    attribution = SessionAttribution()
+    sequence = [
+        ("SessionStart", "A", "startup", "match"),
+        ("SessionEnd", "A", None, "match"),
+        ("SessionStart", "C", "startup", "mismatch"),
+    ]
+    assert _replay_tagged(attribution, sequence) == [True, True, False]
+    assert attribution.bound_ended is True
+    assert attribution.foreign_ids == {"C"}
+
+
+def test_pinned_and_trusted_lineage_drops_an_unannounced_mismatch_stop():
+    """Pinned + trusted: an unannounced id's Stop — admitted by the pin rules alone
+    (the Copilot toolu_ allowance) — is foreign once it is tagged `mismatch`,
+    while the pin's own events pass whatever their tag."""
+    attribution = SessionAttribution(pinned_id=P)
+    sequence = [
+        ("SessionStart", P, "startup", "match"),
+        ("Stop", "X", None, "mismatch"),
+        ("Stop", "toolu_1", None, "match"),
+        ("Stop", P, None, "mismatch"),
+    ]
+    assert _replay_tagged(attribution, sequence) == [True, False, True, True]
+    assert attribution.lineage_state == "trusted"
+    assert attribution.foreign_ids == {"X"}

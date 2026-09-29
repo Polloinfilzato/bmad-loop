@@ -930,9 +930,14 @@ class GenericAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter):
         # never seeds `session_id` below — that still comes from the events.
         attribution = SessionAttribution(pinned_id=handle.pinned_session_id)
         # events dropped as a nested CLI's (heartbeat + timeout-fired carry the
-        # count); the crumb fires once per foreign id, not once per event.
+        # count); the crumb fires once per foreign id, not once per event — and
+        # once for all id-less drops, under the None key (DW-507).
         foreign_hook_events = 0
-        crumbed_foreign: set[str] = set()
+        crumbed_foreign: set[str | None] = set()
+        # DW-507: the one-shot crumb for a lineage the first SessionStart could
+        # not calibrate ("miscalibrated"/"unavailable"), so the degrade to the
+        # #767 rules alone is visible in session-lifecycle.jsonl.
+        lineage_crumbed = False
         transcript_path: str | None = None
         nudges_left = self._stop_nudges
         # Positive grace arms at launch for dev/review sessions, so a CLI that
@@ -1530,17 +1535,34 @@ class GenericAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter):
             # `session_id_flag`), any never-own id's SessionEnd even unannounced
             # (DW-508); other unannounced events and id-less events pass. Copilot toolu_
             # subagent Stops never announce, so they pass here and stay owned by
-            # the subagent filter below.
-            if not attribution.admit(event):
+            # the subagent filter below. Once the relay-side lineage is trusted
+            # (DW-507), a "mismatch"-tagged event is foreign too, id-less or not.
+            admitted = attribution.admit(event)
+            if (
+                not lineage_crumbed
+                and attribution.lineage_state is not None
+                and attribution.lineage_state != "trusted"
+            ):
+                lineage_crumbed = True
+                self._note_lifecycle(
+                    handle.task_id,
+                    "hook-lineage-untrusted",
+                    reason=attribution.lineage_state,
+                    lineage=event.lineage,
+                )
+            if not admitted:
                 foreign_hook_events += 1
-                # admit() only drops identified events, so session_id is set.
-                if event.session_id and event.session_id not in crumbed_foreign:
-                    crumbed_foreign.add(event.session_id)
+                # Identified drops crumb once per id; id-less ones (only a trusted
+                # lineage mismatch drops those; "" counts as id-less) share the
+                # None key.
+                foreign_key = event.session_id or None
+                if foreign_key not in crumbed_foreign:
+                    crumbed_foreign.add(foreign_key)
                     self._note_lifecycle(
                         handle.task_id,
                         "foreign-hook-event-ignored",
                         hook_event=event.event,
-                        foreign_session_id=event.session_id,
+                        foreign_session_id=foreign_key,
                         dropped_so_far=foreign_hook_events,
                     )
                 continue

@@ -1435,6 +1435,13 @@ def test_new_window_posix_argv_byte_identical(monkeypatch, tmp_path):
         "A=1",
         "-e",
         "B=2",
+        # DW-507: a POSIX prelude records the launched pid, then execs the pane's
+        # $SHELL (tmux's default-shell) on the command, passed as $1. The program
+        # is absolute, so a profile's [env] PATH overlay cannot re-point it.
+        "/bin/sh",
+        "-c",
+        'BMAD_LOOP_LAUNCH_PID=$$; export BMAD_LOOP_LAUNCH_PID; exec "${SHELL:-/bin/sh}" -c "$1"',
+        "sh",
         "cmd",
     ]
 
@@ -1443,14 +1450,15 @@ def test_new_window_posix_command_reaches_tmux_verbatim(monkeypatch, tmp_path):
     # The contract says `command` is a shlex-joined argv, not a shell line.
     # The POSIX leaf must not parse or re-quote it: whatever the caller built
     # arrives at tmux as one verbatim trailing argument, so operator-looking
-    # tokens the caller quoted (here a literal "&&" argument) survive intact.
+    # tokens the caller quoted (here a literal "&&" argument) survive intact —
+    # as the DW-507 prelude's `$1`, never spliced into its source.
     rec = _RecordRun()
     monkeypatch.setattr(tmux_base.subprocess, "run", rec)
 
     command = shlex.join(["echo", "a b", "&&", "reboot"])
     TmuxMultiplexer().new_window("s", "n", tmp_path, {}, command)
 
-    assert rec.argv == [
+    assert rec.argv[:11] == [
         "tmux",
         "new-window",
         "-t",
@@ -1462,8 +1470,73 @@ def test_new_window_posix_command_reaches_tmux_verbatim(monkeypatch, tmp_path):
         "-P",
         "-F",
         "#{window_id}",
-        command,
     ]
+    assert rec.argv[-5:] == ["/bin/sh", "-c", tmux_base.LAUNCH_PRELUDE, "sh", command]
+    assert len(rec.argv) == 16
+
+
+_PID_PROBE = (
+    "import os, sys; "
+    "sys.stdout.write(os.environ.get('BMAD_LOOP_LAUNCH_PID', '-') + ' ' + str(os.getpid()))"
+)
+
+
+def _launch_argv(monkeypatch, tmp_path, command):
+    """The trailing launch argv the POSIX leaf hands tmux for `command`."""
+    rec = _RecordRun()
+    with monkeypatch.context() as m:
+        m.setattr(tmux_base.subprocess, "run", rec)
+        TmuxMultiplexer().new_window("s", "n", tmp_path, {}, command)
+    tail = rec.argv[-5:]
+    assert tail[:2] == ["/bin/sh", "-c"]
+    return tail
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX sh")
+def test_new_window_launch_prelude_exports_the_launched_pid(monkeypatch, tmp_path):
+    """DW-507: the window's launch argv, run for real under `SHELL=/bin/sh`, hands
+    the command its OWN pid in BMAD_LOOP_LAUNCH_PID — the prelude records `$$`
+    and `exec`s the shell, which execs a single `-c` command, so `$$` is the
+    CLI's pid: what the relays walk their parent chain toward. The command
+    reaches the shell intact as `$1`.
+
+    Ablation: drop `export` from the prelude and the probe sees nothing."""
+    tail = _launch_argv(monkeypatch, tmp_path, shlex.join([sys.executable, "-c", _PID_PROBE]))
+    env = {k: v for k, v in os.environ.items() if k != "BMAD_LOOP_LAUNCH_PID"}
+    env["SHELL"] = "/bin/sh"
+    proc = subprocess.run(tail, env=env, capture_output=True, text=True, timeout=30)
+
+    assert proc.returncode == 0, proc.stderr
+    seen, own = proc.stdout.split()
+    assert seen == own
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX sh")
+def test_new_window_launch_runs_the_command_under_the_panes_shell(monkeypatch, tmp_path):
+    """DW-507 keeps tmux's `default-shell`: tmux sets `SHELL` to it in every pane,
+    and the prelude execs `$SHELL -c <command>` — so an operator's rc-file PATH
+    and shell functions still resolve the CLI, exactly as a bare
+    `new-window <command>` did. A `SHELL` pointing at a recording wrapper
+    proves the command runs under it, verbatim.
+
+    Ablation: make the prelude exec a bare `sh -c "$1"` and the record is never
+    written."""
+    record = tmp_path / "shell-invoked"
+    fake_shell = tmp_path / "fake-shell"
+    fake_shell.write_text(
+        "#!/bin/sh\n" f"printf '%s\\n' \"$@\" > {shlex.quote(str(record))}\n" 'exec /bin/sh "$@"\n'
+    )
+    fake_shell.chmod(0o755)
+    command = shlex.join([sys.executable, "-c", _PID_PROBE])
+    tail = _launch_argv(monkeypatch, tmp_path, command)
+    env = {k: v for k, v in os.environ.items() if k != "BMAD_LOOP_LAUNCH_PID"}
+    env["SHELL"] = str(fake_shell)
+    proc = subprocess.run(tail, env=env, capture_output=True, text=True, timeout=30)
+
+    assert proc.returncode == 0, proc.stderr
+    assert record.read_text().splitlines() == ["-c", command]
+    seen, own = proc.stdout.split()
+    assert seen == own
 
 
 class _FakeDialect(TmuxMultiplexer):

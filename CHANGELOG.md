@@ -7,6 +7,18 @@ breaking changes may land in a minor release.
 
 ## [Unreleased]
 
+### Added
+
+- Tag hook events with relay-side process lineage; once the launched session's first
+  `SessionStart` reads `match`, a nested CLI's `mismatch` events (id-less included) are
+  dropped. Untrusted lineage writes one `hook-lineage-untrusted` crumb (DW-507).
+
+### Changed
+
+- A tmux coding-CLI pane's start command now shows the `/bin/sh -c
+'BMAD_LOOP_LAUNCH_PID=$$; …'` prelude; the command itself runs under `default-shell`
+  exactly as before (DW-507).
+
 ### Fixed
 
 - Ignore hook events from nested coding-CLI sessions that inherit the relay environment,

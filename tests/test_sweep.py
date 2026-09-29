@@ -5357,8 +5357,9 @@ def failed_session_effect(
     for a malformed document) at `<run_dir>/tasks/<task_id>/result.json`, and hook
     events on the out-of-tree channel (`BMAD_LOOP_EVENTS_DIR`) and/or the legacy
     in-tree `<run_dir>/events`, correlated exactly as the relay stamps them. An
-    event is a kind (session id "s") or a `(kind, session_id)` pair; timestamps
-    strictly increase, so events replay in the order given.
+    event is a kind (session id "s"), a `(kind, session_id)` pair, or a
+    `(kind, session_id, lineage)` triple carrying the relay's DW-507 tag;
+    timestamps strictly increase, so events replay in the order given.
     `ledger` rewrites the deferred-work ledger first (a migration's work)."""
 
     def effect(spec):
@@ -5378,10 +5379,13 @@ def failed_session_effect(
         last_ts = 0
         for directory, kinds in channels:
             for item in kinds:
-                kind, session_id = (item, "s") if isinstance(item, str) else item
+                item = (item, "s") if isinstance(item, str) else tuple(item)
+                kind, session_id = item[0], item[1]
                 directory.mkdir(parents=True, exist_ok=True)
                 ts = last_ts = max(time.time_ns(), last_ts + 1)
                 payload = {"ts": ts, "event": kind, "task_id": task_id, "session_id": session_id}
+                if len(item) > 2:
+                    payload["lineage"] = item[2]
                 (directory / f"{ts}-{task_id}-{kind}.json").write_text(json.dumps(payload))
         return result if result is not None else SessionResult(status=status)
 
@@ -5576,6 +5580,57 @@ def test_non_completed_triage_diagnostic_counts_parent_stop_beside_a_foreign_chi
     assert diag["hook_event_count"] == 2
     assert diag["hook_foreign_ids"] == 1
     assert "hook events: stop; foreign ignored: 1]" in engine.state.paused_reason
+
+
+def test_non_completed_triage_diagnostic_counts_id_less_lineage_drops(project):
+    """DW-507: the replay applies the relay-side lineage rule too. Once the
+    parent's first SessionStart is tagged `match`, a nested child's id-less
+    `mismatch` Stop is dropped — it adds no foreign id, so without its own count
+    the escalation would hide that a Stop arrived and was ignored. The verdict
+    covers the parent alone; the id-less drops are counted and named, and the
+    existing `foreign ignored` text stays as it was.
+
+    Ablation guard: drop the `hook_foreign_idless` count and this fails on it
+    and on the suffix; drop the trusted-mismatch rule and `hook_events` reads
+    "stop" from the child's Stop."""
+    write_ledger(project, {"DW-1": "open"})
+    effect = failed_session_effect(
+        primary_events=[
+            ("SessionStart", "parent", "match"),
+            ("SessionStart", "child", "mismatch"),
+            ("Stop", None, "mismatch"),
+            ("Stop", None, "mismatch"),
+        ]
+    )
+    engine, _ = make_sweep(project, [effect, effect])
+    engine.run()
+
+    diag = _decisions(engine, "triage-decision")[-1]["diagnostic"]
+    assert diag["hook_events"] == "session-start-without-stop"
+    assert diag["hook_event_count"] == 1
+    assert diag["hook_foreign_ids"] == 1
+    assert diag["hook_foreign_idless"] == 2
+    assert (
+        "hook events: session-start-without-stop; foreign ignored: 1; foreign id-less events ignored: 2]"
+        in engine.state.paused_reason
+    )
+
+
+def test_non_completed_triage_diagnostic_omits_the_id_less_text_when_none_dropped(project):
+    """Untrusted lineage (the first start untagged, as from an older relay) keeps
+    the #767 rules: the id-less Stop is admitted, the count is 0, and the suffix
+    gains no id-less text."""
+    write_ledger(project, {"DW-1": "open"})
+    effect = failed_session_effect(
+        primary_events=[("SessionStart", "parent"), ("Stop", None, "mismatch")]
+    )
+    engine, _ = make_sweep(project, [effect, effect])
+    engine.run()
+
+    diag = _decisions(engine, "triage-decision")[-1]["diagnostic"]
+    assert diag["hook_events"] == "stop"
+    assert diag["hook_foreign_idless"] == 0
+    assert "id-less" not in engine.state.paused_reason
 
 
 def test_non_completed_triage_on_a_hookless_adapter_reports_hooks_not_applicable(project):
