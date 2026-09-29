@@ -2155,6 +2155,42 @@ def test_pinned_session_id_match_settles_the_check(tmp_path, monkeypatch):
     ]
 
 
+@pytest.mark.parametrize(
+    ("parent_id", "expected"),
+    [(None, []), ("resumed-id", [("resumed-id", "resume")])],
+    ids=["parent-honours-pin", "parent-ignores-pin"],
+)
+def test_pinned_session_id_check_defers_a_nested_mismatch_start(
+    tmp_path, monkeypatch, parent_id, expected
+):
+    """DW-509: a nested CLI's start (one launched by a parallel SessionStart
+    hook) can reach the events dir before the launched session's own. Rejected
+    by the pin and tagged `mismatch` by the relay, it is not the CLI's answer to
+    `--session-id`, so the check waits for the next start: a parent carrying
+    the pin crumbs nothing, and a parent reporting another id is the one named.
+
+    Ablation: drop the `admitted or lineage != "mismatch"` guard and the child's
+    start crumbs in both cases (and latches the check before the parent's)."""
+    adapter, _, _ = _pinned_timeout_run(
+        tmp_path,
+        monkeypatch,
+        lambda pinned: [
+            _hook_event(
+                "SessionStart", session_id="child-id", source="startup", lineage="mismatch"
+            ),
+            _hook_event(
+                "SessionStart",
+                session_id=parent_id or pinned,
+                source="resume" if parent_id else "startup",
+                lineage="match",
+            ),
+        ],
+    )
+
+    crumbs = _lifecycle_events(adapter, "pinned-session-id-mismatch")
+    assert [(c["reported_session_id"], c["source"]) for c in crumbs] == expected
+
+
 def test_pinned_session_id_check_skips_anonymous_and_rebind_starts(tmp_path, monkeypatch):
     """DW-509 negative: an anonymous start (unreadable payload) carries no id to
     compare, and a `compact` rotation is the launched session changing its own

@@ -939,7 +939,8 @@ class GenericAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter):
         # #767 rules alone is visible in session-lifecycle.jsonl.
         lineage_crumbed = False
         # DW-509: whether the CLI honoured the launch-time pin is settled by the
-        # first identified non-rebind SessionStart; unpinned, there is nothing to
+        # first identified non-rebind SessionStart that is not a rejected
+        # "mismatch"-tagged (nested) one; unpinned, there is nothing to
         # check. A mismatch leaves the launched session foreign to attribution
         # (its Stop is dropped), so it is crumbed once instead of staying silent.
         pin_checked = handle.pinned_session_id is None
@@ -1560,8 +1561,13 @@ class GenericAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter):
                 and event.event == "SessionStart"
                 and event.session_id
                 and event.source not in REBIND_SOURCES
+                and (admitted or event.lineage != "mismatch")
             ):
-                # Observation only: attribution has already judged the event.
+                # Observation only: attribution has already judged the event. A
+                # rejected start the relay tagged "mismatch" is a nested CLI's
+                # (one launched by a parallel SessionStart hook can win the race
+                # to the events dir), not the CLI's answer to the pin, so it
+                # defers the check to the next start.
                 pin_checked = True
                 if event.session_id != handle.pinned_session_id:
                     self._note_lifecycle(

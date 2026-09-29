@@ -301,7 +301,8 @@ One row per story (or sweep bundle/triage task) in the selected run:
   `miscalibrated` or `unavailable`, `lineage` the first start's tag, DW-507),
   `pinned-session-id-mismatch` (once per session when the first identified
   non-`clear`/`compact` `SessionStart` of a pinned launch reports an id other than
-  the pin — `pinned_session_id`, `reported_session_id`, `source`, DW-509),
+  the pin — a rejected `mismatch`-tagged nested start is skipped —
+  `pinned_session_id`, `reported_session_id`, `source`, DW-509),
   mux transport faults `liveness-probe-failed` / `liveness-probe-recovered` /
   `nudge-send-failed`, observation faults `parked-probe-failed` /
   `log-evidence-failed` / `result-json-refused` / `usage-sample-failed` /
