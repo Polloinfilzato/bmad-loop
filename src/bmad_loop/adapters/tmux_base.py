@@ -468,9 +468,10 @@ class BaseTmuxBackend(TerminalMultiplexer):
         ``.zshenv``) still applies. The program is the absolute ``/bin/sh``,
         never a PATH lookup, so a profile's ``[env] PATH`` overlay cannot
         re-point it. The prelude's ``exec`` keeps ``$$``
-        the pane's process: bash, zsh and dash then exec a single ``-c``
-        command, so the recorded pid IS the CLI's; fish forks it, so the pid is
-        fish's and the relays' launch-chain rule skips the CLI under it.
+        the pane's process: bash and zsh then exec a single ``-c`` command, so
+        the recorded pid IS the CLI's; fish and dash (Debian/Ubuntu ``/bin/sh``,
+        0.5.12) fork it, so the pid is the shell's and the relays' launch-chain
+        rule skips the CLI under it.
 
         The prelude is POSIX source and is built as a LITERAL argv, not through
         :meth:`_shell_wrap`: a leaf that overrides ``_shell_wrap`` for another

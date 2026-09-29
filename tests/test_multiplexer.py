@@ -1477,8 +1477,18 @@ def test_new_window_posix_command_reaches_tmux_verbatim(monkeypatch, tmp_path):
 
 _PID_PROBE = (
     "import os, sys; "
-    "sys.stdout.write(os.environ.get('BMAD_LOOP_LAUNCH_PID', '-') + ' ' + str(os.getpid()))"
+    "sys.stdout.write(os.environ.get('BMAD_LOOP_LAUNCH_PID', '-') + ' ' "
+    "+ str(os.getpid()) + ' ' + str(os.getppid()))"
 )
+
+
+def _assert_launch_pid(stdout):
+    """The probe's recorded launch pid is its own (the shell exec'd the single
+    `-c` command: bash, zsh) or its parent's (the shell forked it: dash — the
+    Ubuntu CI `/bin/sh` — and fish). Either way the relays' launch-chain rule
+    reaches the launched pid; nothing further up may be recorded."""
+    seen, own, parent = stdout.split()
+    assert seen in (own, parent)
 
 
 def _launch_argv(monkeypatch, tmp_path, command):
@@ -1495,10 +1505,11 @@ def _launch_argv(monkeypatch, tmp_path, command):
 @pytest.mark.skipif(os.name == "nt", reason="POSIX sh")
 def test_new_window_launch_prelude_exports_the_launched_pid(monkeypatch, tmp_path):
     """DW-507: the window's launch argv, run for real under `SHELL=/bin/sh`, hands
-    the command its OWN pid in BMAD_LOOP_LAUNCH_PID — the prelude records `$$`
-    and `exec`s the shell, which execs a single `-c` command, so `$$` is the
-    CLI's pid: what the relays walk their parent chain toward. The command
-    reaches the shell intact as `$1`.
+    the command the launched pid in BMAD_LOOP_LAUNCH_PID — the prelude records
+    `$$` and `exec`s the shell; bash execs a single `-c` command, so `$$` is the
+    CLI's own pid, while dash (Ubuntu's `/bin/sh`) forks it, so `$$` is its
+    direct parent's. Either is what the relays walk their parent chain toward.
+    The command reaches the shell intact as `$1`.
 
     Ablation: drop `export` from the prelude and the probe sees nothing."""
     tail = _launch_argv(monkeypatch, tmp_path, shlex.join([sys.executable, "-c", _PID_PROBE]))
@@ -1507,8 +1518,7 @@ def test_new_window_launch_prelude_exports_the_launched_pid(monkeypatch, tmp_pat
     proc = subprocess.run(tail, env=env, capture_output=True, text=True, timeout=30)
 
     assert proc.returncode == 0, proc.stderr
-    seen, own = proc.stdout.split()
-    assert seen == own
+    _assert_launch_pid(proc.stdout)
 
 
 @pytest.mark.skipif(os.name == "nt", reason="POSIX sh")
@@ -1535,8 +1545,7 @@ def test_new_window_launch_runs_the_command_under_the_panes_shell(monkeypatch, t
 
     assert proc.returncode == 0, proc.stderr
     assert record.read_text().splitlines() == ["-c", command]
-    seen, own = proc.stdout.split()
-    assert seen == own
+    _assert_launch_pid(proc.stdout)
 
 
 class _FakeDialect(TmuxMultiplexer):

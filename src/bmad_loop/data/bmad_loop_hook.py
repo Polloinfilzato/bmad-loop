@@ -135,7 +135,7 @@ def _lineage(event_name, marker):
     CLI started from the launched CLI's Bash tool is one — so the walk skips
     only what a hook invocation legitimately puts in between:
       - the launch chain: any process started within _LAUNCH_SHIM_WINDOW_S of
-        the launched pid. A forking default-shell (fish) is the launched pid
+        the launched pid. A forking default-shell (fish, dash) is the launched pid
         and the CLI its child; a node shim's real binary is a child again.
         Whatever the CLI starts at launch (MCP servers, a SessionStart hook
         running another CLI) is inside the window too and reads "match".
