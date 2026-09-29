@@ -2077,6 +2077,98 @@ def test_trusted_lineage_mismatch_stop_is_counted_not_completed(tmp_path, monkey
     assert fired["foreign_hook_events"] == 1
 
 
+def _pinned_timeout_run(tmp_path, monkeypatch, make_events):
+    """Drive a pinned handle through `make_events(pinned_id)` to its timeout:
+    nothing in these streams completes the session, so once the script runs dry
+    the clock crosses the deadline and ends the wait."""
+    adapter, clock = _timeout_clock_adapter(tmp_path, monkeypatch)
+    adapter._stall_grace_s = 0.0
+    pinned = str(uuid.uuid4())
+    events = make_events(pinned)
+    n_events = len(events)
+
+    def advance(call_n):
+        if call_n > n_events:
+            clock["mono"] += 1000.0
+
+    adapter.watcher = _ScriptedWatcher(events, on_call=advance)
+    handle = SessionHandle(task_id="3-1-dev-1", native_id="@1", pinned_session_id=pinned)
+    result = adapter.wait_for_completion(handle, _short_spec(tmp_path, timeout_s=100.0))
+    assert result.status == "timeout"
+    return adapter, result, pinned
+
+
+def test_pinned_session_id_mismatch_is_crumbed_once(tmp_path, monkeypatch):
+    """DW-509: a CLI that reports an id other than the launch-time pin on its
+    first non-rebind SessionStart (here an overlay's `--resume`) is foreign to
+    attribution, so its own Stop is dropped and only the timeout ends it. The
+    divergence is visible as ONE `pinned-session-id-mismatch` crumb; a later
+    child's `startup` start does not crumb again.
+
+    Ablation: delete the crumb in `wait_for_completion` and this fails; drop the
+    `pin_checked` latch and the child's start crumbs a second time."""
+    adapter, result, pinned = _pinned_timeout_run(
+        tmp_path,
+        monkeypatch,
+        lambda pinned: [
+            _hook_event("SessionStart", session_id="resumed-id", source="resume"),
+            _stop_event("3-1-dev-1", "resumed-id", None),
+            _hook_event("SessionStart", session_id="child-id", source="startup"),
+        ],
+    )
+
+    assert result.stop_seen is False
+    (crumb,) = _lifecycle_events(adapter, "pinned-session-id-mismatch")
+    assert crumb == {
+        "ts": crumb["ts"],
+        "event": "pinned-session-id-mismatch",
+        "pinned_session_id": pinned,
+        "reported_session_id": "resumed-id",
+        "source": "resume",
+    }
+
+
+def test_pinned_session_id_match_settles_the_check(tmp_path, monkeypatch):
+    """DW-509 negative: a first start carrying the pin settles the check, so a
+    nested child's `startup` start after it is attribution's business (dropped
+    and crumbed as foreign), not a pin mismatch.
+
+    Ablation: drop the `pin_checked` latch and the child's start crumbs."""
+    adapter, _, _ = _pinned_timeout_run(
+        tmp_path,
+        monkeypatch,
+        lambda pinned: [
+            _hook_event("SessionStart", session_id=pinned, source="startup"),
+            _hook_event("SessionStart", session_id="child-id", source="startup"),
+        ],
+    )
+
+    assert _lifecycle_events(adapter, "pinned-session-id-mismatch") == []
+    ignored = _lifecycle_events(adapter, "foreign-hook-event-ignored")
+    assert [(entry["hook_event"], entry["foreign_session_id"]) for entry in ignored] == [
+        ("SessionStart", "child-id")
+    ]
+
+
+def test_pinned_session_id_check_skips_anonymous_and_rebind_starts(tmp_path, monkeypatch):
+    """DW-509 negative: an anonymous start (unreadable payload) carries no id to
+    compare, and a `compact` rotation is the launched session changing its own
+    id, so neither is a pin mismatch.
+
+    Ablation: drop the `source not in REBIND_SOURCES` guard and the rotation
+    crumbs."""
+    adapter, _, _ = _pinned_timeout_run(
+        tmp_path,
+        monkeypatch,
+        lambda pinned: [
+            _hook_event("SessionStart", session_id=None),
+            _hook_event("SessionStart", session_id="rotated-id", source="compact"),
+        ],
+    )
+
+    assert _lifecycle_events(adapter, "pinned-session-id-mismatch") == []
+
+
 @pytest.mark.parametrize(
     ("first_tag", "reason"),
     [("mismatch", "miscalibrated"), ("unknown", "unavailable"), (None, "unavailable")],

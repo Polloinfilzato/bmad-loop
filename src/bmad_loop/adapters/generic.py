@@ -48,7 +48,7 @@ from ..model import TokenUsage
 from ..mountpaths import rebased_project
 from ..policy import Policy
 from ..process_host import ProcessHostError, get_process_host
-from ..signals import SessionAttribution, SignalWatcher
+from ..signals import REBIND_SOURCES, SessionAttribution, SignalWatcher
 from ..tokens import read_usage as tally_usage
 from ..verify import read_frontmatter, status_of
 from .base import (
@@ -938,6 +938,11 @@ class GenericAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter):
         # not calibrate ("miscalibrated"/"unavailable"), so the degrade to the
         # #767 rules alone is visible in session-lifecycle.jsonl.
         lineage_crumbed = False
+        # DW-509: whether the CLI honoured the launch-time pin is settled by the
+        # first identified non-rebind SessionStart; unpinned, there is nothing to
+        # check. A mismatch leaves the launched session foreign to attribution
+        # (its Stop is dropped), so it is crumbed once instead of staying silent.
+        pin_checked = handle.pinned_session_id is None
         transcript_path: str | None = None
         nudges_left = self._stop_nudges
         # Positive grace arms at launch for dev/review sessions, so a CLI that
@@ -1550,6 +1555,22 @@ class GenericAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter):
                     reason=attribution.lineage_state,
                     lineage=event.lineage,
                 )
+            if (
+                not pin_checked
+                and event.event == "SessionStart"
+                and event.session_id
+                and event.source not in REBIND_SOURCES
+            ):
+                # Observation only: attribution has already judged the event.
+                pin_checked = True
+                if event.session_id != handle.pinned_session_id:
+                    self._note_lifecycle(
+                        handle.task_id,
+                        "pinned-session-id-mismatch",
+                        pinned_session_id=handle.pinned_session_id,
+                        reported_session_id=event.session_id,
+                        source=event.source,
+                    )
             if not admitted:
                 foreign_hook_events += 1
                 # Identified drops crumb once per id; id-less ones (only a trusted

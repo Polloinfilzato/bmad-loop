@@ -12,6 +12,9 @@ breaking changes may land in a minor release.
 - Tag hook events with relay-side process lineage; once the launched session's first
   `SessionStart` reads `match`, a nested CLI's `mismatch` events (id-less included) are
   dropped. Untrusted lineage writes one `hook-lineage-untrusted` crumb (DW-507).
+- Write one `pinned-session-id-mismatch` crumb when a pinned session's first non-rebind
+  `SessionStart` reports an id other than the pin, so the drop of its own events as
+  foreign is no longer silent (DW-509).
 
 ### Changed
 
