@@ -1673,9 +1673,14 @@ def test_pinned_id_from_start_session_drives_wait_for_completion(tmp_path, monke
 
     def flush_terminal_spec(call_n):
         if call_n == 3:
-            (impl / "spec-3-1-foo.md").write_text(
-                "---\nstatus: done\n---\n\n## Auto Run Result\n\nStatus: done\n"
-            )
+            spec_path = impl / "spec-3-1-foo.md"
+            spec_path.write_text("---\nstatus: done\n---\n\n## Auto Run Result\n\nStatus: done\n")
+            # The handle's launched_ns is real (time.time_ns() at start_session),
+            # and a Windows mtime comes from a coarser clock, so a spec written
+            # just after can read as older than the launch and be skipped as a
+            # stale prior artifact. Stamp it past the launch.
+            later = handle.launched_ns + _MTIME_TICK_NS
+            os.utime(spec_path, ns=(later, later))
 
     adapter.watcher = _ScriptedWatcher(
         [
