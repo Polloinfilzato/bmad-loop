@@ -14,5 +14,5 @@ untouched, for 80 s.
   a repaint.
 - Words are separated by cursor-position escapes (`Enter\e[8Gto\e[11Gconfirm`), so
   a raw-byte substring match does not find the footer text; the rendered pane does.
-- Line endings are CR CR LF, and git has no `.gitattributes` rule for this file, so a
-  Windows `autocrlf` checkout may rewrite them. Byte-exact assertions must account for that.
+- Line endings are CR CR LF; `.gitattributes` marks `*.pipe-pane.log` `-text`, so no
+  `autocrlf` checkout rewrites them.

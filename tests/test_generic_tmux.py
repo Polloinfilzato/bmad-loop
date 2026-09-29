@@ -9713,6 +9713,86 @@ def test_pane_matched_prompt_withholds_the_stall_nudge(tmp_path, monkeypatch, li
     assert mux.captures == ["@1"]
 
 
+# DW-339's operator capture: raw `tmux pipe-pane` bytes of a claude trust prompt
+# left parked for 80 s (Claude Code 2.1.284; provenance in the sibling .md).
+TRUST_PROMPT_LOG = Path(__file__).parent / "fixtures" / "claude-trust-prompt-parked.pipe-pane.log"
+_CHA = regex.compile(rb"\x1b\[(\d*)G")
+_NON_CHA_ESCAPE = regex.compile(
+    rb"\x1b(?:\[[0-?]*[ -/]*[@-~]|\][^\x07\x1b]*(?:\x07|\x1b\\)|P.*?\x1b\\|[0-~])", regex.S
+)
+
+
+def _render_pane(raw: bytes) -> str:
+    """The visible text `capture-pane -p` shows for the DW-339 capture: each CHA
+    (`ESC[<n>G`) pads the line out to its column, and every other escape is
+    dropped. The capture separates words with CHA, so a raw-byte match cannot
+    find the footer. Its only other cursor moves (`ESC[1C`, `ESC[4A`) come after
+    the footer and are followed by nothing but terminal queries, so dropping
+    them loses no text. A capture that moves the cursor and then prints needs a
+    real terminal model. CRs are dropped, so a Windows `autocrlf` checkout
+    renders the same."""
+    rows = []
+    for line in raw.replace(b"\r", b"").split(b"\n"):
+        row = ""
+        pos = 0
+        for m in _CHA.finditer(line):
+            row += _NON_CHA_ESCAPE.sub(b"", line[pos : m.start()]).decode()
+            row = row.ljust(int(m.group(1) or b"1") - 1)
+            pos = m.end()
+        row += _NON_CHA_ESCAPE.sub(b"", line[pos:]).decode()
+        rows.append(row.rstrip())
+    return "\n".join(rows)
+
+
+def test_parked_trust_prompt_capture_is_parked_and_no_work(tmp_path, monkeypatch):
+    """DW-339, replayed from the committed capture: the trust prompt paints once
+    within 5 s and the log stays byte-static for the 80 s the operator watched.
+    The operator's 5 s size samples (see the sibling .md) show no timer repaint,
+    and the trailing terminal queries were never re-sent. So no tick after
+    FIRST_FRAME_S sees the pane change, and `activity_seen` stays False. At grace expiry the shipped claude footer pattern (the #727 footer,
+    identical on this dialog) matches the rendered screen: the due nudge is
+    withheld and the session ends `stalled` + `parked` with `produced_work` False,
+    so it pauses instead of retrying.
+
+    ABLATION: drop the `> FIRST_FRAME_S` guard in `sample_frame` and the one paint
+    counts as work (True)."""
+    raw = TRUST_PROMPT_LOG.read_bytes()
+    screen = _render_pane(raw)
+    assert "Quick safety check: Is this a project you created or one you trust?" in screen
+    assert BYPASS_FOOTER in [row.strip() for row in screen.splitlines()]  # rendered only
+    assert BYPASS_FOOTER.encode() not in raw
+    assert BYPASS_HEADING not in screen  # the footer alone labels this dialog
+
+    monkeypatch.setattr(generic, "RESULT_GRACE_S", 0.0)
+    mux = _UnitMux(screen=screen)
+    adapter, _ = make_dev_adapter(tmp_path, mux=mux)
+    adapter._stall_grace_s = 70.0  # the static stretch outlasts the 60 s bar
+    adapter._stall_nudges = 1  # a nudge is due at expiry: the gate must withhold it
+    adapter._window_alive = lambda handle: True
+    log = _pane_log(adapter, "3-1-dev-1", 0)  # 0 B at launch, as captured
+    clock = _steerable_clock(monkeypatch)
+    launched = clock["t"]
+
+    def script(call_n):
+        if call_n == 1:
+            clock["t"] += 1.0  # the whole capture lands inside the startup window
+            _grow(log, raw)
+        else:
+            clock["t"] += 5.0  # the operator's 5 s samples: no byte ever added
+
+    adapter.watcher = _ScriptedWatcher([], on_call=script)
+    spec = dataclasses.replace(_dev_spec(tmp_path), timeout_s=1000.0)
+    result = adapter.wait_for_completion(_dev_handle(), spec)
+
+    assert clock["t"] - launched > 60.0  # parked past the capture's bar before expiry
+    assert (result.status, result.parked) == ("stalled", True)
+    assert result.parked_evidence is not None
+    assert result.parked_evidence.endswith(BYPASS_FOOTER)
+    assert mux.sent == []
+    assert result.stop_seen is False
+    assert result.produced_work is False
+
+
 def test_clean_pane_nudges_exactly_as_today(tmp_path, monkeypatch):
     """A screen with nothing parked-shaped on it changes nothing: both wake nudges
     go out (one capture before each), then the ordinary stall — whose own expiry
